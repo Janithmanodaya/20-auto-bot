@@ -353,13 +353,11 @@ async def reconcile_open_trades():
                 leverage = int(position.get('leverage', CONFIG.get("MAX_BOT_LEVERAGE", 20)))
                 notional = qty * entry_price
 
-                # Calculate a default SL/TP based on current ATR
-                df = await asyncio.to_thread(fetch_klines_sync, symbol, CONFIG["TIMEFRAME"], 200)
-                atr_now = atr(df, CONFIG["ATR_LENGTH"]).iloc[-1]
-                sl_distance = CONFIG["SL_TP_ATR_MULT"] * atr_now
-                
-                stop_price = entry_price - sl_distance if side == 'BUY' else entry_price + sl_distance
-                take_price = entry_price + sl_distance if side == 'BUY' else entry_price - sl_distance
+                try:
+                    stop_price, take_price = await asyncio.to_thread(default_sl_tp_for_import, symbol, entry_price, side)
+                except RuntimeError as e:
+                    log.error(f"Failed to calculate default SL/TP for {symbol}: {e}")
+                    continue
 
                 # Create a new trade record
                 trade_id = f"{symbol}_imported_{int(time.time())}"
@@ -460,12 +458,11 @@ async def check_and_import_rogue_trades():
                 leverage = int(position.get('leverage', CONFIG.get("MAX_BOT_LEVERAGE", 20)))
                 notional = qty * entry_price
 
-                df = await asyncio.to_thread(fetch_klines_sync, symbol, CONFIG["TIMEFRAME"], 200)
-                atr_now = atr(df, CONFIG["ATR_LENGTH"]).iloc[-1]
-                sl_distance = CONFIG["SL_TP_ATR_MULT"] * atr_now
-                
-                stop_price = entry_price - sl_distance if side == 'BUY' else entry_price + sl_distance
-                take_price = entry_price + sl_distance if side == 'BUY' else entry_price - sl_distance
+                try:
+                    stop_price, take_price = await asyncio.to_thread(default_sl_tp_for_import, symbol, entry_price, side)
+                except RuntimeError as e:
+                    log.error(f"Failed to calculate default SL/TP for {symbol}: {e}")
+                    continue
 
                 trade_id = f"{symbol}_imported_{int(time.time())}"
                 meta = {
@@ -774,6 +771,17 @@ def get_public_ip() -> str:
         return requests.get("https://api.ipify.org", timeout=5).text
     except Exception:
         return "unable-to-fetch-ip"
+
+def default_sl_tp_for_import(symbol: str, entry_price: float, side: str) -> tuple[float, float]:
+    df = fetch_klines_sync(symbol, CONFIG["TIMEFRAME"], 200)
+    if df is None or df.empty:
+        raise RuntimeError("No kline data to calc default SL/TP")
+    atr_now = float(atr(df, CONFIG["ATR_LENGTH"]).iloc[-1])
+    atr_mult = CONFIG.get("SL_TP_ATR_MULT") or CONFIG.get("STRATEGY_EXIT_PARAMS", {}).get('1', {}).get("ATR_MULTIPLIER") or 2.0
+    sl_dist = atr_mult * atr_now
+    stop_price = entry_price - sl_dist if side == 'BUY' else entry_price + sl_dist
+    take_price = entry_price + sl_dist if side == 'BUY' else entry_price - sl_dist
+    return stop_price, take_price
 
 def timeframe_to_timedelta(tf: str) -> Optional[timedelta]:
     """Converts a timeframe string like '1m', '5m', '1h', '1d' to a timedelta object."""
@@ -1663,7 +1671,7 @@ def place_market_order_with_sl_tp_sync(symbol: str, side: str, qty: float, lever
         close_order_params['positionSide'] = position_side
     else:
         # In one-way mode, closing orders must be reduceOnly. Entry order must not.
-        close_order_params['reduceOnly'] = 'true'
+        close_order_params['reduceOnly'] = True
 
     # Build the full order batch
     order_batch = [market_order_params]
@@ -1792,7 +1800,7 @@ def place_batch_sl_tp_sync(symbol: str, side: str, sl_price: Optional[float] = N
     if IS_HEDGE_MODE:
         base_close_order['positionSide'] = position_side
     else:
-        base_close_order['reduceOnly'] = 'true'
+        base_close_order['reduceOnly'] = True
 
     if sl_price:
         sl_order = base_close_order.copy()
@@ -2321,6 +2329,9 @@ async def evaluate_and_enter(symbol: str):
 
     try:
         df_raw = await asyncio.to_thread(fetch_klines_sync, symbol, CONFIG["TIMEFRAME"], 300)
+        if df_raw is None or df_raw.empty:
+            log.warning(f"fetch_klines_sync returned empty for {symbol}. Skipping evaluation.")
+            return
         
         last_ts = df_raw.index[-1]
         cache_key = (symbol, CONFIG["TIMEFRAME"])
@@ -2439,26 +2450,61 @@ async def evaluate_strategy_bb(symbol: str, df: pd.DataFrame, test_signal: str |
         _record_rejection(symbol, "S1-Qty zero after sizing", {"ideal": ideal_qty, "min": qty_min})
         return
 
-    # Build trade meta (simple managed trade)
-    meta = {
-        "symbol": symbol,
-        "strategy": "S1-BB",
-        "side": side,
-        "entry_price": entry_price,
-        "sl": sl_price,
-        "qty": float(final_qty),
-        "timestamp": int(time.time()),
-    }
+    # --- Recalculate final notional and leverage ---
+    notional = final_qty * entry_price
+    margin_to_use = CONFIG["MARGIN_USDT_SMALL_BALANCE"] if balance < CONFIG["RISK_SMALL_BALANCE_THRESHOLD"] else risk_usdt
+    leverage = int(math.floor(notional / max(margin_to_use, 1e-9)))
+    max_leverage = min(CONFIG.get("MAX_BOT_LEVERAGE", 30), get_max_leverage(symbol))
+    leverage = max(1, min(leverage, max_leverage))
 
-    # Test mode: skip actual placement but report meta
+    # --- Place Order ---
+    take_price = entry_price + (2 * distance) if side == 'BUY' else entry_price - (2 * distance)
+    
     if test_signal:
-        _record_rejection(symbol, "S1-Test mode (would place)", meta)
-        return meta
+        log.info(f"S1 TEST MODE: Would place limit order for {final_qty} {symbol} at {entry_price:.4f}")
+        return
 
-    # Persist managed trade and notify
-    await asyncio.to_thread(add_managed_trade_to_db, meta)
-    await asyncio.to_thread(send_telegram, f"✅ S1: Opened BB {symbol} {side} @ {entry_price:.6f} qty={final_qty}")
-    return meta
+    limit_order_resp = await asyncio.to_thread(place_limit_order_sync, symbol, side, final_qty, entry_price)
+    order_id = str(limit_order_resp.get('orderId'))
+    pending_order_id = f"{symbol}_{order_id}"
+
+    candle_duration = timeframe_to_timedelta(CONFIG['TIMEFRAME'])
+    expiry_candles = CONFIG.get("ORDER_EXPIRY_CANDLES", 2)
+    expiry_time = df.index[-1] + (candle_duration * (expiry_candles - 1))
+
+    pending_meta = {
+        "id": pending_order_id, "order_id": order_id, "symbol": symbol,
+        "side": side, "qty": final_qty, "limit_price": entry_price,
+        "stop_price": sl_price, "take_price": take_price, "leverage": leverage,
+        "risk_usdt": risk_usdt, "place_time": datetime.utcnow().isoformat(),
+        "expiry_time": expiry_time.isoformat(),
+        "strategy_id": 1,
+        "atr_at_entry": atr_val
+    }
+    
+    async with pending_limit_orders_lock:
+        pending_limit_orders[pending_order_id] = pending_meta
+        if firebase_db:
+            try:
+                validate_firebase_data(pending_meta)
+                await asyncio.to_thread(firebase_db.child("pending_limit_orders").child(pending_order_id).set, pending_meta)
+            except ValueError as e:
+                log.error(f"Firebase validation failed for pending order {pending_order_id}: {e}")
+            except Exception as e:
+                log.exception(f"Failed to save pending order {pending_order_id} to Firebase: {e}")
+
+    log.info(f"Placed pending limit order (S1-BB): {pending_meta}")
+    title = "⏳ *New Pending Order: S1-BB*"
+    new_order_msg = (
+        f"{title}\n\n"
+        f"**Symbol:** `{symbol}`\n"
+        f"**Side:** `{side}`\n"
+        f"**Price:** `{entry_price:.4f}`\n"
+        f"**Qty:** `{final_qty}`\n"
+        f"**Risk:** `{risk_usdt:.2f} USDT`\n"
+        f"**Leverage:** `{leverage}x`"
+    )
+    await asyncio.to_thread(send_telegram, new_order_msg, parse_mode='Markdown')
 
 async def evaluate_strategy_supertrend(symbol: str, df: pd.DataFrame, test_signal: str | None = None):
     """
@@ -2533,23 +2579,63 @@ async def evaluate_strategy_supertrend(symbol: str, df: pd.DataFrame, test_signa
         _record_rejection(symbol, "S2-Qty zero after sizing", {"ideal": ideal_qty, "min": qty_min})
         return
 
-    meta = {
-        "symbol": symbol,
-        "strategy": "S2-SuperTrend",
-        "side": side,
-        "entry_price": entry_price,
-        "sl": sl_price,
-        "qty": float(final_qty),
-        "timestamp": int(time.time()),
-    }
+    # --- Recalculate final notional and leverage ---
+    notional = final_qty * entry_price
+    margin_to_use = CONFIG["MARGIN_USDT_SMALL_BALANCE"] if balance < CONFIG["RISK_SMALL_BALANCE_THRESHOLD"] else risk_usdt
+    leverage = int(math.floor(notional / max(margin_to_use, 1e-9)))
+    max_leverage = min(CONFIG.get("MAX_BOT_LEVERAGE", 30), get_max_leverage(symbol))
+    leverage = max(1, min(leverage, max_leverage))
 
+    # --- Place Order ---
+    tp_distance = atr_val * CONFIG["STRATEGY_EXIT_PARAMS"]['2']["ATR_MULTIPLIER"] * 1.5
+    take_price = entry_price + tp_distance if side == 'BUY' else entry_price - tp_distance
+    
     if test_signal:
-        _record_rejection(symbol, "S2-Test mode (would place)", meta)
-        return meta
+        log.info(f"S2 TEST MODE: Would place limit order for {final_qty} {symbol} at {entry_price:.4f}")
+        return
 
-    await asyncio.to_thread(add_managed_trade_to_db, meta)
-    await asyncio.to_thread(send_telegram, f"✅ S2: Opened ST {symbol} {side} @ {entry_price:.6f} qty={final_qty}")
-    return meta
+    limit_order_resp = await asyncio.to_thread(place_limit_order_sync, symbol, side, final_qty, entry_price)
+    order_id = str(limit_order_resp.get('orderId'))
+    pending_order_id = f"{symbol}_{order_id}"
+
+    candle_duration = timeframe_to_timedelta(CONFIG['TIMEFRAME'])
+    expiry_candles = CONFIG.get("ORDER_EXPIRY_CANDLES", 2)
+    expiry_time = df.index[-1] + (candle_duration * (expiry_candles - 1))
+
+    pending_meta = {
+        "id": pending_order_id, "order_id": order_id, "symbol": symbol,
+        "side": side, "qty": final_qty, "limit_price": entry_price,
+        "stop_price": sl_price, "take_price": take_price, "leverage": leverage,
+        "risk_usdt": risk_usdt, "place_time": datetime.utcnow().isoformat(),
+        "expiry_time": expiry_time.isoformat(),
+        "strategy_id": 2,
+        "atr_at_entry": atr_val,
+        "signal_confidence": 100.0 # Placeholder for simple strategy
+    }
+    
+    async with pending_limit_orders_lock:
+        pending_limit_orders[pending_order_id] = pending_meta
+        if firebase_db:
+            try:
+                validate_firebase_data(pending_meta)
+                await asyncio.to_thread(firebase_db.child("pending_limit_orders").child(pending_order_id).set, pending_meta)
+            except ValueError as e:
+                log.error(f"Firebase validation failed for S2 pending order {pending_order_id}: {e}")
+            except Exception as e:
+                log.exception(f"Failed to save S2 pending order {pending_order_id} to Firebase: {e}")
+
+    log.info(f"Placed pending limit order (S2-SuperTrend): {pending_meta}")
+    title = "⏳ *New Pending Order: S2-ST*"
+    new_order_msg = (
+        f"{title}\n\n"
+        f"**Symbol:** `{symbol}`\n"
+        f"**Side:** `{side}`\n"
+        f"**Price:** `{entry_price:.4f}`\n"
+        f"**Qty:** `{final_qty}`\n"
+        f"**Risk:** `{risk_usdt:.2f} USDT`\n"
+        f"**Leverage:** `{leverage}x`"
+    )
+    await asyncio.to_thread(send_telegram, new_order_msg, parse_mode='Markdown')
 
 async def evaluate_strategy_3(symbol: str, df: pd.DataFrame, test_signal: str | None = None):
     """
@@ -2622,23 +2708,61 @@ async def evaluate_strategy_3(symbol: str, df: pd.DataFrame, test_signal: str | 
         _record_rejection(symbol, "S3-Qty zero after sizing", {"ideal": ideal_qty, "min": qty_min})
         return
 
-    meta = {
-        "symbol": symbol,
-        "strategy": "S3-MA",
-        "side": side,
-        "entry_price": entry_price,
-        "sl": sl_price,
-        "qty": float(final_qty),
-        "timestamp": int(time.time()),
-    }
+    # --- Recalculate final notional and leverage ---
+    notional = final_qty * entry_price
+    margin_to_use = CONFIG["MARGIN_USDT_SMALL_BALANCE"] if balance < CONFIG["RISK_SMALL_BALANCE_THRESHOLD"] else risk_usdt
+    leverage = int(math.floor(notional / max(margin_to_use, 1e-9)))
+    max_leverage = min(CONFIG.get("MAX_BOT_LEVERAGE", 30), get_max_leverage(symbol))
+    leverage = max(1, min(leverage, max_leverage))
 
+    # --- Place Order ---
+    take_price = entry_price + (2 * distance) if side == 'BUY' else entry_price - (2 * distance)
+    
     if test_signal:
-        _record_rejection(symbol, "S3-Test mode (would place)", meta)
-        return meta
+        log.info(f"S3 TEST MODE: Would place limit order for {final_qty} {symbol} at {entry_price:.4f}")
+        return
 
-    await asyncio.to_thread(add_managed_trade_to_db, meta)
-    await asyncio.to_thread(send_telegram, f"✅ S3: Opened MA {symbol} {side} @ {entry_price:.6f} qty={final_qty}")
-    return meta
+    limit_order_resp = await asyncio.to_thread(place_limit_order_sync, symbol, side, final_qty, entry_price)
+    order_id = str(limit_order_resp.get('orderId'))
+    pending_order_id = f"{symbol}_{order_id}"
+
+    candle_duration = timeframe_to_timedelta(CONFIG['TIMEFRAME'])
+    expiry_candles = CONFIG.get("ORDER_EXPIRY_CANDLES", 2)
+    expiry_time = df.index[-1] + (candle_duration * (expiry_candles - 1))
+
+    pending_meta = {
+        "id": pending_order_id, "order_id": order_id, "symbol": symbol,
+        "side": side, "qty": final_qty, "limit_price": entry_price,
+        "stop_price": sl_price, "take_price": take_price, "leverage": leverage,
+        "risk_usdt": risk_usdt, "place_time": datetime.utcnow().isoformat(),
+        "expiry_time": expiry_time.isoformat(),
+        "strategy_id": 3,
+        "atr_at_entry": atr_val
+    }
+    
+    async with pending_limit_orders_lock:
+        pending_limit_orders[pending_order_id] = pending_meta
+        if firebase_db:
+            try:
+                validate_firebase_data(pending_meta)
+                await asyncio.to_thread(firebase_db.child("pending_limit_orders").child(pending_order_id).set, pending_meta)
+            except ValueError as e:
+                log.error(f"Firebase validation failed for S3 pending order {pending_order_id}: {e}")
+            except Exception as e:
+                log.exception(f"Failed to save S3 pending order {pending_order_id} to Firebase: {e}")
+
+    log.info(f"Placed pending limit order (S3-MA): {pending_meta}")
+    title = "⏳ *New Pending Order: S3-MA*"
+    new_order_msg = (
+        f"{title}\n\n"
+        f"**Symbol:** `{symbol}`\n"
+        f"**Side:** `{side}`\n"
+        f"**Price:** `{entry_price:.4f}`\n"
+        f"**Qty:** `{final_qty}`\n"
+        f"**Risk:** `{risk_usdt:.2f} USDT`\n"
+        f"**Leverage:** `{leverage}x`"
+    )
+    await asyncio.to_thread(send_telegram, new_order_msg, parse_mode='Markdown')
 
 async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Optional[str] = None, full_test: bool = False):
     """
@@ -2671,7 +2795,7 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Option
         side = test_signal
         log.info(f"S4 TEST MODE: Bypassing signal logic for {symbol}, using side: {side}")
         # Use a dummy trail stop for testing
-        trail_distance = s4_params['TRAILING_ATR_MULTIPLIER'] * signal_candle['atr2']
+        trail_distance = s4_params['TRAILING_ATR_MULTIPLIER'] * signal_candle['s4_atr2']
         initial_trail_stop = current_price - trail_distance if side == 'BUY' else current_price + trail_distance
     else:
         # 3. Check for Signal
@@ -2889,6 +3013,9 @@ async def force_trade_entry(strategy_id: int, symbol: str, side: str):
 
     try:
         df = await asyncio.to_thread(fetch_klines_sync, symbol, CONFIG["TIMEFRAME"], 300)
+        if df is None or df.empty:
+            await asyncio.to_thread(send_telegram, f"❌ Cannot force trade. Could not fetch kline data for `{symbol}`.", parse_mode='Markdown')
+            return
         current_price = df['close'].iloc[-1]
         
         # --- Strategy-Specific Parameter Calculation ---
@@ -4309,7 +4436,7 @@ async def generate_and_send_report():
 def generate_adv_chart_sync(symbol: str):
     try:
         df = fetch_klines_sync(symbol, CONFIG["TIMEFRAME"], limit=200)
-        if df.empty:
+        if df is None or df.empty:
             return "Could not fetch k-line data for " + symbol, None
 
         df['sma'] = sma(df['close'], CONFIG["SMA_LEN"])
