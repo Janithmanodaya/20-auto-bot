@@ -225,6 +225,7 @@ session_freeze_override = False
 notified_frozen_session: Optional[str] = None
 
 rejected_trades = deque(maxlen=5)
+last_attention_alert_time: Dict[str, datetime] = {}
 symbol_loss_cooldown: Dict[str, Dict[int, datetime]] = {}
 
 # Account state
@@ -329,14 +330,17 @@ async def reconcile_open_trades():
         else:
             log.warning(f"ℹ️ Reconciled DB trade: {trade_id} ({symbol}) is closed on Binance. Archiving.")
             # This part could be enhanced to fetch last trade details for accurate PnL
-            record_trade({
-                'id': trade_id, 'symbol': symbol, 'side': trade_meta['side'],
-                'entry_price': trade_meta['entry_price'], 'exit_price': None, # Exit price is unknown
-                'qty': trade_meta['initial_qty'], 'notional': trade_meta['notional'], 
-                'pnl': 0.0, 'open_time': trade_meta['open_time'], 
-                'close_time': datetime.utcnow().isoformat(),
-                'risk_usdt': trade_meta.get('risk_usdt', 0.0)
-            })
+            await asyncio.to_thread(
+                record_trade,
+                {
+                    'id': trade_id, 'symbol': symbol, 'side': trade_meta['side'],
+                    'entry_price': trade_meta['entry_price'], 'exit_price': None, # Exit price is unknown
+                    'qty': trade_meta['initial_qty'], 'notional': trade_meta['notional'], 
+                    'pnl': 0.0, 'open_time': trade_meta['open_time'], 
+                    'close_time': datetime.utcnow().isoformat(),
+                    'risk_usdt': trade_meta.get('risk_usdt', 0.0)
+                }
+            )
             await asyncio.to_thread(remove_managed_trade_from_db, trade_id)
 
     # 2. Import "rogue" positions that are on the exchange but not in the DB
@@ -707,7 +711,7 @@ async def lifespan(app: FastAPI):
         pass
 
     try:
-        await send_telegram("EMA/BB Strategy Bot shut down.")
+        await asyncio.to_thread(send_telegram, "EMA/BB Strategy Bot shut down.")
     except Exception:
         pass
     log.info("Shutdown complete.")
@@ -776,7 +780,7 @@ def default_sl_tp_for_import(symbol: str, entry_price: float, side: str) -> tupl
     df = fetch_klines_sync(symbol, CONFIG["TIMEFRAME"], 200)
     if df is None or df.empty:
         raise RuntimeError("No kline data to calc default SL/TP")
-    atr_now = float(atr(df, CONFIG["ATR_LENGTH"]).iloc[-1])
+    atr_now = safe_latest_atr_from_df(df)
     atr_mult = CONFIG.get("SL_TP_ATR_MULT") or CONFIG.get("STRATEGY_EXIT_PARAMS", {}).get('1', {}).get("ATR_MULTIPLIER") or 2.0
     sl_dist = atr_mult * atr_now
     stop_price = entry_price - sl_dist if side == 'BUY' else entry_price + sl_dist
@@ -1092,6 +1096,16 @@ def init_db():
         cur.execute("ALTER TABLE managed_trades ADD COLUMN s4_trailing_active INTEGER")
     except sqlite3.OperationalError: pass
 
+    # Table for symbols that require manual attention
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS attention_required (
+        symbol TEXT PRIMARY KEY,
+        reason TEXT,
+        details TEXT,
+        timestamp TEXT
+    )
+    """)
+
     conn.commit()
     conn.close()
 
@@ -1259,6 +1273,30 @@ def bollinger_bands(series: pd.Series, length: int, std: float) -> tuple[pd.Seri
     upper_band = ma + (std_dev * std)
     lower_band = ma - (std_dev * std)
     return upper_band, lower_band
+
+
+def safe_latest_atr_from_df(df: Optional[pd.DataFrame]) -> float:
+    """Return the latest ATR value from df or 0.0 if df is None/empty or ATR can't be computed."""
+    try:
+        if df is None or getattr(df, 'empty', True):
+            return 0.0
+        atr_series = atr(df, CONFIG.get("ATR_LENGTH", 14))
+        if atr_series is None or atr_series.empty:
+            return 0.0
+        return float(atr_series.iloc[-1])
+    except Exception:
+        log.exception("safe_latest_atr_from_df failed; returning 0.0")
+        return 0.0
+
+
+def safe_last(series: pd.Series, default=0.0) -> float:
+    """Safely get the last value of a series, returning a default if it's empty or the value is NaN."""
+    if series is None or series.empty:
+        return float(default)
+    last_val = series.iloc[-1]
+    if pd.isna(last_val):
+        return float(default)
+    return float(last_val)
 
 
 def adx(df: pd.DataFrame, period: int = 14):
@@ -1703,20 +1741,40 @@ def place_market_order_with_sl_tp_sync(symbol: str, side: str, qty: float, lever
             market_order_resp = batch_response[0]
             if 'orderId' in market_order_resp:
                 log.warning(f"Market order for {symbol} was successful but SL/TP failed. Attempting to close the naked position.")
-                try:
-                    time.sleep(1) # Give exchange time to register position
-                    client.futures_create_order(
-                        symbol=symbol,
-                        side=close_side,
-                        type='MARKET',
-                        quantity=str(qty),
-                        positionSide=position_side,
-                        reduceOnly=True
-                    )
-                    log.info(f"Successfully closed naked position for {symbol}.")
-                except Exception as close_e:
-                    log.exception(f"CRITICAL: FAILED TO CLOSE NAKED POSITION for {symbol}. Manual intervention required. Error: {close_e}")
-                    send_telegram(f"🚨 CRITICAL: FAILED TO CLOSE NAKED POSITION for {symbol}. Manual intervention required.")
+                
+                closed_successfully = False
+                for i in range(3): # Retry up to 3 times
+                    try:
+                        time.sleep(1 + i) # Give exchange time, with increasing delay
+                        client.futures_create_order(
+                            symbol=symbol,
+                            side=close_side,
+                            type='MARKET',
+                            quantity=str(qty),
+                            positionSide=position_side,
+                            reduceOnly=True
+                        )
+                        log.info(f"Successfully closed naked position for {symbol} on attempt {i + 1}.")
+                        closed_successfully = True
+                        break # Exit loop on success
+                    except Exception as close_e:
+                        log.exception(f"Attempt {i + 1} to close naked position for {symbol} failed. Error: {close_e}")
+                
+                if not closed_successfully:
+                    error_details = f"Failed to close naked position for {qty} {symbol} after multiple attempts."
+                    log.critical(error_details)
+                    send_telegram(f"🚨 CRITICAL: {error_details} Manual intervention required.")
+                    
+                    # Persist the failure for the monitor thread to pick up
+                    try:
+                        conn = sqlite3.connect(CONFIG["DB_FILE"])
+                        cur = conn.cursor()
+                        cur.execute("INSERT OR REPLACE INTO attention_required VALUES (?, ?, ?, ?)",
+                                    (symbol, "NAKED_POSITION", error_details, datetime.utcnow().isoformat()))
+                        conn.commit()
+                        conn.close()
+                    except Exception as db_e:
+                        log.exception(f"Failed to record attention_required for {symbol}: {db_e}")
 
             sl_tp_orders = [o for o in successful_orders if o.get('type') in ('STOP_MARKET', 'TAKE_PROFIT_MARKET')]
             if sl_tp_orders:
@@ -2037,8 +2095,8 @@ def validate_and_sanity_check_sync(send_report: bool = True) -> Dict[str, Any]:
             bbu_s, bbl_s = bollinger_bands(raw_df['close'], CONFIG["STRATEGY_1"]["BB_LENGTH"], CONFIG["STRATEGY_1"]["BB_STD"])
             
             results["checks"].append({"type": "indicators_sample", "ok": True, "detail": {
-                "sma": float(sma_s.iloc[-1]), "rsi": float(rsi_s.iloc[-1]), 
-                "bbu": float(bbu_s.iloc[-1]), "bbl": float(bbl_s.iloc[-1])
+                "sma": safe_last(sma_s), "rsi": safe_last(rsi_s),
+                "bbu": safe_last(bbu_s), "bbl": safe_last(bbl_s)
             }})
         except Exception as e:
             results["ok"] = False
@@ -2127,6 +2185,9 @@ def select_strategy(df: pd.DataFrame, symbol: str) -> Optional[int]:
     Determines which strategy to use for a symbol based on market conditions and configuration.
     Returns the strategy ID (1, 2, 3, 4) or None if no strategy is suitable.
     """
+    if df is None or df.empty:
+        log.warning(f"Cannot select strategy for {symbol}, dataframe is empty.")
+        return None
     last = df.iloc[-1]
     
     # --- Data validation ---
@@ -2895,7 +2956,7 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Option
             
             base_close = {'symbol': symbol, 'side': close_side, 'quantity': str(qty)}
             if IS_HEDGE_MODE: base_close['positionSide'] = position_side
-            else: base_close['reduceOnly'] = 'true'
+            else: base_close['reduceOnly'] = True
             
             sl_order = base_close.copy()
             sl_order.update({'type': 'STOP_MARKET', 'stopPrice': round_price(symbol, sl_price)})
@@ -2938,7 +2999,7 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Option
             log.info(f"S4: Placing MARKET {side} order for {qty} {symbol} at ~{current_price}")
             await asyncio.to_thread(open_market_position_sync, symbol, side, qty, leverage)
 
-            time.sleep(2)
+            await asyncio.sleep(2)
             positions = await asyncio.to_thread(client.futures_position_information, symbol=symbol)
             position_side = 'LONG' if side == 'BUY' else 'SHORT'
             pos = next((p for p in positions if p.get('positionSide') == position_side and float(p.get('positionAmt', 0)) != 0), None)
@@ -3016,7 +3077,7 @@ async def force_trade_entry(strategy_id: int, symbol: str, side: str):
         if df is None or df.empty:
             await asyncio.to_thread(send_telegram, f"❌ Cannot force trade. Could not fetch kline data for `{symbol}`.", parse_mode='Markdown')
             return
-        current_price = df['close'].iloc[-1]
+        current_price = safe_last(df['close'])
         
         # --- Strategy-Specific Parameter Calculation ---
         sl_price = 0.0
@@ -3028,7 +3089,7 @@ async def force_trade_entry(strategy_id: int, symbol: str, side: str):
         if strategy_id == 1:
             s_params = CONFIG['STRATEGY_1']
             df['atr'] = atr(df, CONFIG["ATR_LENGTH"])
-            atr_now = df['atr'].iloc[-1]
+            atr_now = safe_last(df['atr'])
             sl_distance = CONFIG["STRATEGY_EXIT_PARAMS"]['1']["ATR_MULTIPLIER"] * atr_now
             sl_price = current_price - sl_distance if side == 'BUY' else current_price + sl_distance
             
@@ -3040,29 +3101,29 @@ async def force_trade_entry(strategy_id: int, symbol: str, side: str):
 
         elif strategy_id == 2:
             s_params = CONFIG['STRATEGY_2']
-            supertrend(df, period=s_params['SUPERTREND_PERIOD'], multiplier=s_params['SUPERTREND_MULTIPLIER'])
-            sl_price = df['supertrend'].iloc[-1]
+            df['supertrend'], _ = supertrend(df, period=s_params['SUPERTREND_PERIOD'], multiplier=s_params['SUPERTREND_MULTIPLIER'])
+            sl_price = safe_last(df['supertrend'])
             
             price_distance = abs(current_price - sl_price)
             balance = await asyncio.to_thread(get_account_balance_usdt)
             risk_usdt = calculate_risk_amount(balance, strategy_id=2)
             # For forced trades, we use full risk, no confidence scaling
             qty = risk_usdt / price_distance if price_distance > 0 else 0.0
-            trade_meta_extra = {"atr_at_entry": atr(df, CONFIG["ATR_LENGTH"]).iloc[-1]}
+            trade_meta_extra = {"atr_at_entry": safe_latest_atr_from_df(df)}
 
         elif strategy_id == 3:
             s_params = CONFIG['STRATEGY_3']
-            stop_pct = s_params['INITIAL_STOP_PCT']
+            stop_pct = s_params.get('INITIAL_STOP_PCT', 0.015) # S3 does not have this param, fallback
             sl_price = current_price * (1 - stop_pct) if side == 'BUY' else current_price * (1 + stop_pct)
             
             balance = await asyncio.to_thread(get_account_balance_usdt)
-            risk_usdt = s_params['MAX_LOSS_USD_SMALL_BALANCE'] if balance < CONFIG["RISK_SMALL_BALANCE_THRESHOLD"] else s_params['MAX_LOSS_USD_LARGE_BALANCE']
+            risk_usdt = s_params.get('MAX_LOSS_USD_SMALL_BALANCE', 0.5) if balance < CONFIG["RISK_SMALL_BALANCE_THRESHOLD"] else s_params.get('MAX_LOSS_USD_LARGE_BALANCE', 1.0)
             price_distance = abs(current_price - sl_price)
             qty = risk_usdt / price_distance if price_distance > 0 else 0.0
             
-            df['atr2'] = atr_wilder(df, length=s_params['TRAILING_ATR_PERIOD'])
+            df['atr2'] = atr_wilder(df, length=s_params.get('TRAILING_ATR_PERIOD', 14))
             trade_meta_extra = {
-                "atr_at_entry": df['atr2'].iloc[-1],
+                "atr_at_entry": safe_last(df['atr2']),
                 "s3_trailing_active": False,
                 "s3_trailing_stop": sl_price,
             }
@@ -3079,11 +3140,11 @@ async def force_trade_entry(strategy_id: int, symbol: str, side: str):
             df['atr2'] = atr_wilder(df, length=s_params['TRAILING_ATR_PERIOD'])
             df['hhv10'] = hhv(df['high'], length=s_params['TRAILING_HHV_PERIOD'])
             df['llv10'] = llv(df['low'], length=s_params['TRAILING_HHV_PERIOD'])
-            trail_dist = s_params['TRAILING_ATR_MULTIPLIER'] * df['atr2'].iloc[-1]
+            trail_dist = s_params['TRAILING_ATR_MULTIPLIER'] * safe_last(df['atr2'])
             if side == 'BUY':
-                initial_trail_stop = max(df['hhv10'].iloc[-1] - trail_dist, current_price - trail_dist)
+                initial_trail_stop = max(safe_last(df['hhv10']) - trail_dist, current_price - trail_dist)
             else:
-                initial_trail_stop = min(df['llv10'].iloc[-1] + trail_dist, current_price + trail_dist)
+                initial_trail_stop = min(safe_last(df['llv10']) + trail_dist, current_price + trail_dist)
 
             trade_meta_extra = {
                 "s4_trailing_stop": initial_trail_stop,
@@ -3128,7 +3189,7 @@ async def force_trade_entry(strategy_id: int, symbol: str, side: str):
         await asyncio.to_thread(open_market_position_sync, symbol, side, qty, leverage)
         
         # Give exchange time to update position
-        time.sleep(2) 
+        await asyncio.sleep(2) 
         positions = await asyncio.to_thread(client.futures_position_information, symbol=symbol)
         position_side = 'LONG' if side == 'BUY' else 'SHORT'
         pos = next((p for p in positions if p.get('positionSide') == position_side and float(p.get('positionAmt', 0)) != 0), None)
@@ -3237,9 +3298,28 @@ def get_account_balance_usdt():
     return 0.0
 
 def monitor_thread_func():
-    global managed_trades, last_trade_close_time, running, overload_notified, symbol_loss_cooldown
+    global managed_trades, last_trade_close_time, running, overload_notified, symbol_loss_cooldown, last_attention_alert_time
     log.info("Monitor thread started.")
     while not monitor_stop_event.is_set():
+        try:
+            # Check for symbols that require manual attention
+            conn = sqlite3.connect(CONFIG["DB_FILE"])
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM attention_required")
+            attention_needed = cur.fetchall()
+            conn.close()
+
+            for row in attention_needed:
+                symbol, reason, details, ts = row
+                now = datetime.utcnow()
+                last_alert = last_attention_alert_time.get(symbol)
+                # Alert every 5 minutes
+                if last_alert is None or (now - last_alert).total_seconds() > 300:
+                    send_telegram(f"🚨 ATTENTION REQUIRED on {symbol} 🚨\nReason: {reason}\nDetails: {details}\nTimestamp: {ts}", parse_mode='Markdown')
+                    last_attention_alert_time[symbol] = now
+        except Exception as e:
+            log.exception(f"Failed to check for attention_required symbols: {e}")
+
         loop_start_time = time.time()
         try:
             if client is None:
@@ -3422,6 +3502,9 @@ def monitor_thread_func():
                     send_telegram(error_msg, parse_mode='Markdown')
                     log.warning(f"IP Whitelist Error (Code: -2015). Server IP: {ip}. Sending SIGTERM to own process to trigger restart in 5 seconds...")
                     time.sleep(5) # Give telegram a moment to send
+                    # This is an intentional, drastic action. The bot is designed to be run by a process manager
+                    # (like systemd or Docker with a restart policy). This SIGTERM will cause the bot to exit,
+                    # and the process manager is expected to restart it, hopefully on a new IP if in a cloud environment.
                     os.kill(os.getpid(), signal.SIGTERM) # Send SIGTERM to the whole process
 
                 # Handle other, potentially transient, API errors
@@ -3615,7 +3698,7 @@ def monitor_thread_func():
                         df_monitor['hhv10'] = hhv(df_monitor['high'], length=s3_params['TRAILING_HHV_PERIOD'])
                         df_monitor['llv10'] = llv(df_monitor['low'], length=s3_params['TRAILING_HHV_PERIOD'])
 
-                        atr2_now = df_monitor['atr2'].iloc[-1]
+                        atr2_now = safe_last(df_monitor['atr2'])
                         
                         close_trade = False
                         exit_reason = None
@@ -3629,7 +3712,7 @@ def monitor_thread_func():
 
                         # Exit Rule 2: SuperTrend Flip
                         if not close_trade:
-                            st_direction = df_monitor['supertrend_direction'].iloc[-1]
+                            st_direction = safe_last(df_monitor.get('supertrend_direction'))
                             if (side == 'BUY' and st_direction == -1) or (side == 'SELL' and st_direction == 1):
                                 log.info(f"S3 SuperTrend Flip Exit for {tid}.")
                                 close_trade = True
@@ -3663,12 +3746,12 @@ def monitor_thread_func():
                             new_sl = None
 
                             if side == 'BUY':
-                                candidate_trail = df_monitor['hhv10'].iloc[-1] - trail_dist
+                                candidate_trail = safe_last(df_monitor.get('hhv10')) - trail_dist
                                 price_based_trail = current_price - trail_dist
                                 effective_candidate = min(candidate_trail, price_based_trail)
                                 if effective_candidate > current_trailing_stop: new_sl = effective_candidate
                             else: # SELL
-                                candidate_trail = df_monitor['llv10'].iloc[-1] + trail_dist
+                                candidate_trail = safe_last(df_monitor.get('llv10')) + trail_dist
                                 price_based_trail = current_price + trail_dist
                                 effective_candidate = max(candidate_trail, price_based_trail)
                                 if effective_candidate < current_trailing_stop: new_sl = effective_candidate
@@ -3691,7 +3774,7 @@ def monitor_thread_func():
                     elif strategy_id == '4':
                         # --- Advanced SuperTrend v2 (S4) Exit & Management Logic ---
                         s4_params = CONFIG['STRATEGY_4']
-                        current_price = df_monitor['close'].iloc[-1]
+                        current_price = safe_last(df_monitor['close'])
                         entry_price = meta['entry_price']
                         
                         # 1. Profit Gate Check to activate trailing
@@ -3800,11 +3883,11 @@ def monitor_thread_func():
 
                     # Trailing Stop (For S1 after BE, and for S2 after TP2)
                     if meta.get('trailing_active'):
-                        atr_now = atr(df_monitor, CONFIG["ATR_LENGTH"]).iloc[-1]
+                        atr_now = safe_latest_atr_from_df(df_monitor)
                         
                         volatility_ratio = atr_now / current_price if current_price > 0 else 0
                         adx(df_monitor, period=CONFIG['ADX_PERIOD'])
-                        trend_strength = df_monitor['adx'].iloc[-1] if 'adx' in df_monitor.columns and not pd.isna(df_monitor['adx'].iloc[-1]) else 0
+                        trend_strength = safe_last(df_monitor.get('adx'), default=0)
                         
                         if strategy_id == '2':
                             atr_multiplier = 2.5
@@ -5120,6 +5203,18 @@ def handle_update_sync(update, loop):
                     except Exception as e:
                         log.exception(f"Failed to scale in {trade_id}")
                         send_telegram(f"❌ Error scaling in {trade_id}: {e}")
+            elif text.startswith("/testrun"):
+                send_telegram("🚀 Initiating full test run on testnet...")
+                
+                async def _task():
+                    await run_full_testnet_test()
+
+                fut = asyncio.run_coroutine_threadsafe(_task(), loop)
+                try:
+                    fut.result(timeout=300) # Long timeout for the full test
+                except Exception as e:
+                    log.error(f"Failed to execute /testrun: {e}")
+                    send_telegram(f"❌ Test run failed: {e}")
             else:
                 send_telegram("Unknown command. Use /status to see the keyboard.")
     except Exception:
@@ -5165,6 +5260,151 @@ async def _unfreeze_command():
     frozen = False
     session_freeze_override = True
     log.info("Manual unfreeze issued. Overriding current session freeze if active.")
+
+
+async def run_full_testnet_test():
+    """
+    Runs a full, end-to-end integration test on the Binance testnet.
+    This function is self-contained and uses its own testnet client.
+    """
+    TESTNET_API_KEY = "7fabcde36d70d00d01f9a3d21b38855450aec5c4348d2361fac5c6bd44afd872"
+    TESTNET_API_SECRET = "4c22d3644841e6912dd957a0dfbfd4a6475b7bb6bc3022261173de41f165949c"
+    
+    test_client = None
+    report_lines = ["*Binance Testnet End-to-End Test Report*"]
+    test_symbol = "BTCUSDT"
+    
+    original_managed_trades = {}
+    
+    try:
+        # --- Step 1: Initialize Testnet Client ---
+        report_lines.append("\n*Step 1: Initialization*")
+        await asyncio.to_thread(send_telegram, "1. Initializing testnet client...")
+        
+        # Use a temporary client for the test run
+        temp_client = await asyncio.to_thread(
+            Client, TESTNET_API_KEY, TESTNET_API_SECRET, testnet=True
+        )
+        report_lines.append("✅ Testnet client initialized.")
+
+        # --- Step 2: Sanity Checks ---
+        report_lines.append("\n*Step 2: Sanity Checks*")
+        await asyncio.to_thread(send_telegram, "2. Pinging testnet server...")
+        await asyncio.to_thread(temp_client.ping)
+        report_lines.append("✅ Ping successful.")
+
+        await asyncio.to_thread(send_telegram, f"Fetching 1m klines for {test_symbol}...")
+        klines = await asyncio.to_thread(temp_client.futures_klines, symbol=test_symbol, interval='1m', limit=100)
+        if not klines:
+            raise RuntimeError("Failed to fetch klines from testnet.")
+        report_lines.append(f"✅ Fetched {len(klines)} klines successfully.")
+
+        # --- Step 3: Open Position ---
+        report_lines.append("\n*Step 3: Open Position*")
+        await asyncio.to_thread(send_telegram, "3. Placing a small market BUY order...")
+        qty_to_open = 0.001
+        
+        # Manually construct and send the order using the temporary client
+        market_order = await asyncio.to_thread(
+            temp_client.futures_create_order,
+            symbol=test_symbol, side='BUY', type='MARKET', quantity=qty_to_open
+        )
+        report_lines.append(f"✅ Market order placed. Order ID: `{market_order['orderId']}`")
+        
+        await asyncio.sleep(2)
+
+        # --- Step 4: Verify Position & Create Mock Trade ---
+        report_lines.append("\n*Step 4: Verify Position*")
+        await asyncio.to_thread(send_telegram, "4. Verifying open position...")
+        positions = await asyncio.to_thread(temp_client.futures_position_information, symbol=test_symbol)
+        pos = next((p for p in positions if p.get('symbol') == test_symbol and float(p.get('positionAmt', 0)) != 0), None)
+        
+        if not pos or abs(float(pos.get('positionAmt', 0))) < qty_to_open:
+            raise RuntimeError(f"Position for {test_symbol} not found or quantity mismatch after opening.")
+        
+        entry_price = float(pos['entryPrice'])
+        report_lines.append(f"✅ Position confirmed. Entry Price: `{entry_price}`")
+
+        # --- Step 5: Place SL/TP ---
+        report_lines.append("\n*Step 5: Place SL/TP*")
+        await asyncio.to_thread(send_telegram, "5. Placing SL/TP orders...")
+        sl_price = entry_price * 0.98
+        tp_price = entry_price * 1.02
+        
+        sl_tp_orders = await asyncio.to_thread(
+            temp_client.futures_place_batch_order,
+            batchOrders=[
+                {'symbol': test_symbol, 'side': 'SELL', 'type': 'STOP_MARKET', 'quantity': qty_to_open, 'stopPrice': round_price(test_symbol, sl_price), 'reduceOnly': True},
+                {'symbol': test_symbol, 'side': 'SELL', 'type': 'TAKE_PROFIT_MARKET', 'quantity': qty_to_open, 'stopPrice': round_price(test_symbol, tp_price), 'reduceOnly': True}
+            ]
+        )
+        if any('code' in o for o in sl_tp_orders):
+            raise RuntimeError(f"Failed to place SL/TP orders: {sl_tp_orders}")
+        report_lines.append("✅ SL/TP orders placed successfully.")
+
+        # --- Step 6: Trailing Stop Check ---
+        report_lines.append("\n*Step 6: Trailing Stop Check*")
+        await asyncio.to_thread(send_telegram, "6. Waiting 2 minutes to observe trailing stop... (This will depend on market movement)")
+        
+        # Create a mock trade object to be monitored by the real monitor thread
+        test_trade_id = f"test_{int(time.time())}"
+        mock_trade = {
+            "id": test_trade_id, "symbol": test_symbol, "side": "BUY", "entry_price": entry_price,
+            "initial_qty": qty_to_open, "qty": qty_to_open, "notional": qty_to_open * entry_price,
+            "leverage": 10, "sl": sl_price, "tp": tp_price, "open_time": datetime.utcnow().isoformat(),
+            "sltp_orders": sl_tp_orders, "trailing_active": True, "be_moved": True, 'strategy_id': '1'
+        }
+        
+        async with managed_trades_lock:
+            managed_trades[test_trade_id] = mock_trade
+            
+        await asyncio.sleep(120)
+
+        async with managed_trades_lock:
+            final_trade_state = managed_trades.get(test_trade_id, mock_trade)
+        
+        final_sl = final_trade_state.get('sl', sl_price)
+        if final_sl > sl_price:
+            report_lines.append(f"✅ Trailing Stop Moved! Initial: `{sl_price:.4f}`, Final: `{final_sl:.4f}`")
+        else:
+            report_lines.append(f"ℹ️ Trailing stop did not move. Initial: `{sl_price:.4f}`, Final: `{final_sl:.4f}`")
+
+    except Exception as e:
+        log.exception("Test run failed.")
+        error_msg = f"❌ Test run failed: {e}"
+        report_lines.append(error_msg)
+        
+    finally:
+        # --- Step 7: Cleanup ---
+        report_lines.append("\n*Step 7: Cleanup*")
+        await asyncio.to_thread(send_telegram, "7. Cleaning up test orders and position...")
+        
+        if test_trade_id:
+            async with managed_trades_lock:
+                managed_trades.pop(test_trade_id, None)
+
+        if temp_client:
+            try:
+                await asyncio.to_thread(temp_client.futures_cancel_all_open_orders, symbol=test_symbol)
+                report_lines.append("✅ Canceled open orders on testnet.")
+                
+                positions = await asyncio.to_thread(temp_client.futures_position_information, symbol=test_symbol)
+                pos = next((p for p in positions if p.get('symbol') == test_symbol and float(p.get('positionAmt', 0)) != 0), None)
+                if pos:
+                    close_qty = abs(float(pos['positionAmt']))
+                    await asyncio.to_thread(
+                        temp_client.futures_create_order,
+                        symbol=test_symbol, side='SELL', type='MARKET', quantity=close_qty
+                    )
+                    report_lines.append("✅ Closed open position on testnet.")
+                else:
+                    report_lines.append("✅ No open position to close.")
+
+            except Exception as e:
+                log.exception("Test cleanup failed.")
+                report_lines.append(f"❌ Cleanup failed: {e}")
+
+        await asyncio.to_thread(send_telegram, "\n".join(report_lines), parse_mode='Markdown')
 
 async def handle_critical_error_async(exc: Exception, context: str = None):
     global running
