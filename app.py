@@ -478,7 +478,19 @@ REJECTION_REASON_EMOJI = {
     "S9-Invalid SL distance": "🧮",
     "S9-Stop too wide vs M5 range": "📐",
     "S9-Qty below minimum": "📉",
-}
+
+    # Strategy 10 (AA + VBM)
+    "S10-Restricted symbol": "🚫",
+    "S10-Not enough M15 data": "⏳",
+    "S10-Not enough H1 data": "⏳",
+    "S10-AA stop too wide": "📐",
+    "S10-No valid AA/VBM setup": "🧩",
+    "S10-Entry/Stop calc failed": "🧮",
+    "S10-Invalid SL distance": "🧮",
+    "S10-Qty below minimum": "📉",
+    "S10-VBM stop too wide": "📐_code",new
+</}
+
 
 # Account state
 IS_HEDGE_MODE: Optional[bool] = None
