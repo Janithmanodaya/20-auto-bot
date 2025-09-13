@@ -1273,6 +1273,130 @@ def send_telegram(msg: str, document_content: Optional[bytes] = None, document_n
         log.exception("Failed to send telegram message")
 
 
+def _symbol_base_asset(symbol: str) -> str:
+    """
+    Try to infer the base asset for a symbol like BTCUSDT -> BTC.
+    Falls back to stripping a stable-quote suffix.
+    """
+    try:
+        si = get_symbol_info(symbol)
+        if si and 'baseAsset' in si:
+            return str(si['baseAsset']).upper()
+    except Exception:
+        pass
+    # Fallback heuristics
+    for quote in ("USDT", "BUSD", "USDC", "FDUSD", "TUSD", "BTC", "ETH"):
+        if symbol.upper().endswith(quote):
+            return symbol.upper()[: -len(quote)]
+    return symbol.upper()
+
+
+def _alphavantage_time_from(dt: datetime) -> str:
+    """
+    Format datetime for Alpha Vantage NEWS_SENTIMENT time_from param: YYYYMMDDTHHMM
+    """
+    return dt.strftime("%Y%m%dT%H%M")
+
+
+def fetch_recent_news_impact(symbol: str, hours: int = 24, max_items: int = 3) -> Dict[str, Any]:
+    """
+    Fetch recent news using Alpha Vantage NEWS_SENTIMENT for the base asset and
+    provide a lightweight impact classification and reason text.
+    Returns dict: {impact, reason, articles:[{title,url,time,summary}]}
+    """
+    base = _symbol_base_asset(symbol)
+    api_key = ALPHA_VANTAGE_API_KEY or ""
+    if not api_key:
+        return {"impact": "None", "reason": "No API key configured for news.", "articles": []}
+    # Try a few ticker formats to increase hit rate
+    candidates = [f"CRYPTO:{base}", base]
+    cutoff = datetime.utcnow() - timedelta(hours=hours)
+    time_from = _alphavantage_time_from(cutoff)
+    articles: list[dict] = []
+    session = requests.Session()
+    session.headers.update({"User-Agent": "ema-bb-bot/1.0"})
+    for t in candidates:
+        try:
+            url = "https://www.alphavantage.co/query"
+            params = {
+                "function": "NEWS_SENTIMENT",
+                "tickers": t,
+                "sort": "LATEST",
+                "time_from": time_from,
+                "apikey": api_key,
+            }
+            resp = session.get(url, params=params, timeout=15)
+            if resp.status_code != 200:
+                continue
+            data = resp.json()
+            feed = data.get("feed") or []
+            for item in feed:
+                try:
+                    ts = item.get("time_published")
+                    # format: 20250101T120000
+                    dt = datetime.strptime(ts, "%Y%m%dT%H%M%S") if ts else None
+                    title = item.get("title") or ""
+                    url_i = item.get("url") or ""
+                    summary = item.get("summary") or ""
+                    # Vendor sentiment may exist
+                    overall = item.get("overall_sentiment_label") or ""
+                    articles.append({
+                        "time": dt.isoformat() if dt else ts,
+                        "title": title[:180],
+                        "url": url_i,
+                        "summary": summary[:280],
+                        "sentiment": overall
+                    })
+                except Exception:
+                    continue
+            if articles:
+                break
+        except Exception:
+            continue
+
+    if not articles:
+        return {"impact": "None", "reason": "No recent news found.", "articles": []}
+
+    # Simple impact scoring
+    positive_kw = [
+        "etf approval", "etf inflow", "partnership", "integration", "upgrade",
+        "mainnet", "testnet", "milestone", "adoption", "institutional", "launch", "listing", "raised"
+    ]
+    negative_kw = [
+        "hack", "exploit", "outage", "downtime", "regulatory", "ban", "lawsuit",
+        "sec sues", "delist", "bug", "halt", "penalty", "warning", "vulnerability"
+    ]
+    pos, neg = 0, 0
+    reasons = []
+    for a in articles[:max_items]:
+        text = f"{a.get('title','')} {a.get('summary','')}".lower()
+        # bias by vendor sentiment if present
+        s = (a.get("sentiment") or "").lower()
+        if "positive" in s:
+            pos += 1
+        elif "negative" in s:
+            neg += 1
+        # keyword scoring
+        for kw in positive_kw:
+            if kw in text:
+                pos += 1
+                reasons.append(f"+ {kw}")
+        for kw in negative_kw:
+            if kw in text:
+                neg += 1
+                reasons.append(f"- {kw}")
+
+    if pos > neg and (pos - neg) >= 1:
+        impact = "Positive"
+    elif neg > pos and (neg - pos) >= 1:
+        impact = "Negative"
+    else:
+        impact = "Neutral"
+
+    reason = ", ".join(reasons[:5]) if reasons else "Mixed/low-signal headlines in the last 24h."
+    return {"impact": impact, "reason": reason, "articles": articles[:max_items]}
+
+
 def log_and_send_error(context_msg: str, exc: Optional[Exception] = None):
     """
     Logs an exception and sends a formatted error message to Telegram.
@@ -4714,12 +4838,11 @@ async def evaluate_strategy_10(symbol: str, df_m15: pd.DataFrame):
             await asyncio.to_thread(add_pending_order_to_db, pending_meta)
 
         title = "⏳ New Pending Order: S10-AA+VBM"
-        new_order_msg = (
-            f"{title}\n\n"
-            f"Symbol: `{symbol}`\n"
-            f"Side: `{side}`\n"
-            f"Mode: `{'STACKED' if stacked else ('AA' if aa_ok else 'VBM')}`\n"
-            f"Price: `{entry_price:.4f}`\n"
+        # Fetch recent news sentiment/impact for context
+        try:
+            news = await asyncio.to_thread(fetch_recent_news_impact, symbol, 24, 3)
+        except Exception:
+            news = {"impact": "NonePrice: `{entry_price:.4f}`\n"
             f"Qty: `{final_qty}`\n"
             f"Risk: `{actual_risk_usdt:.2f} USDT`\n"
             f"Leverage: `{leverage}x`"
