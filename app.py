@@ -2318,6 +2318,32 @@ def get_current_price_sync(symbol: str) -> float:
         pass
     return 0.0
 
+
+def compute_be_sl(symbol: str, side: Optional[str], entry_price: float, strategy_id: Optional[int]) -> float:
+    """
+    Returns the break-even stop price with a small buffer for the given strategy.
+    - For BUY: BE = entry_price * (1 + buffer_pct)
+    - For SELL: BE = entry_price * (1 - buffer_pct)
+    Defaults to 0 buffer if not configured.
+    """
+    try:
+        if strategy_id == 10:
+            pct = float(CONFIG.get('STRATEGY_10', {}).get('BE_BUFFER_PCT', 0.0))
+        elif strategy_id == 5:
+            pct = float(CONFIG.get('STRATEGY_5', {}).get('BE_BUFFER_PCT', 0.0))
+        else:
+            pct = 0.0
+    except Exception:
+        pct = 0.0
+
+    if pct <= 0 or not np.isfinite(entry_price) or entry_price <= 0:
+        return float(entry_price)
+
+    if str(side).upper() == 'BUY':
+        return float(entry_price) * (1.0 + pct)
+    else:
+        return float(entry_price) * (1.0 - pct)
+
 def place_limit_order_sync(symbol: str, side: str, qty: float, price: float, leverage: Optional[int] = None):
     """
     Places a single limit order with safety features:
@@ -6388,7 +6414,7 @@ def monitor_thread_func():
                                 
                                 cancel_trade_sltp_orders_sync(meta)
                                 new_qty = meta['qty'] - qty_to_close
-                                new_sl_price = entry_price # Move to BE
+                                new_sl_price = compute_be_sl(symbol, side, float(entry_price), int(meta.get('strategy_id') if isinstance(meta, dict) else strategy_id if 'strategy_id' in locals() else 10)) # Move to BE with buffer
                                 new_orders = place_batch_sl_tp_sync(sym, side, sl_price=new_sl_price, qty=new_qty) if new_qty > 0 else {}
 
                                 trade_to_update_in_db = None
