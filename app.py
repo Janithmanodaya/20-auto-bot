@@ -265,7 +265,8 @@ CONFIG = {
             "BE_SL_OFFSET": 0.0
         },
         "10": {  # S10 uses S5-style management; no generic BE/TP here
-            "ATR_MULTIPLIER": float(os.getenv("S10_TRAIL_ATR_MULT", os.getenv("S5_TRAIL_ATR_MULT", "1.0"))),
+            # Make trailing less aggressive by default (increase ATR multiplier)
+            "ATR_MULTIPLIER": float(os.getenv("S10_TRAIL_ATR_MULT", os.getenv("S5_TRAIL_ATR_MULT", "1.75"))),
             "BE_TRIGGER": 0.0,
             "BE_SL_OFFSET": 0.0
         }
