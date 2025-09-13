@@ -1419,7 +1419,22 @@ def handle_reject_cmd():
                     v_fmt = str(v)
                 detail_lines.append(f"   - {k}: {v_fmt}")
 
+            # Append formatted section
+            section = (
+                f"{emoji} `{ts}` — `{symbol}`\n"
+                f"Reason: {reason}\n"
+                + "\n".join(detail_lines)
+            )
+            sections.append(section)
+        except Exception:
+            # Fallback rendering to avoid breaking the whole message
+            try:
+                sections.append(f"⚠️ Error rendering rejection record: {json.dumps(reject)}")
+            except Exception:
+                sections.append("⚠️ Error rendering rejection record.")
 
+    msg = "\n\n".join(sections)
+    send_telegram(msg, parse_mode="Markdown")
 
 
 SESSION_FREEZE_WINDOWS = {
