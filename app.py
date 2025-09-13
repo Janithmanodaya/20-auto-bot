@@ -1392,34 +1392,45 @@ def handle_reject_cmd():
     for reject in reversed(list(rejected_trades)):
         try:
             ts = datetime.fromisoformat(reject['timestamp']).strftime('%H:%M:%S')
-            symbol = reject.get('symbol', 'N/A')
-            reason = reject.get('reason', 'Unknown')
-            details = reject.get('details') or {}
+        except Exception:
+            ts = "N/A"
+        symbol = reject.get('symbol', 'N/A')
+        reason = reject.get('reason', 'Unknown')
+        details = reject.get('details') or {}
 
-            # Pick an emoji based on the reason
-            emoji = REJECTION_REASON_EMOJI.get(reason, "⚠️")
+        # Pick an emoji based on the reason
+        emoji = REJECTION_REASON_EMOJI.get(reason, "⚠️")
 
-            # If details is empty, add helpful defaults
-            if not details:
-                details = {
-                    "note": "No extra diagnostics captured for this rejection.",
-                    "timeframe": CONFIG.get("TIMEFRAME", "N/A"),
-                }
+        # If details is empty, add helpful defaults
+        if not details:
+            details = {
+                "note": "No extra diagnostics captured for this rejection.",
+                "timeframe": CONFIG.get("TIMEFRAME", "N/A"),
+            }
 
-            # Build details block as bullet list
-            detail_lines = []
-            for k, v in details.items():
-                # Normalize to simple scalars/strings
-                try:
-                    if isinstance(v, float):
-                        v_fmt = f"{v:.4f}"
-                    else:
-                        v_fmt = str(v)
-                except Exception:
+        # Build details block as bullet list
+        detail_lines = []
+        for k, v in details.items():
+            # Normalize to simple scalars/strings
+            try:
+                if isinstance(v, float):
+                    v_fmt = f"{v:.4f}"
+                else:
                     v_fmt = str(v)
-                detail_lines.append(f"   - {k}: {v_fmt}")
+            except Exception:
+                v_fmt = str(v)
+            detail_lines.append(f"   - {k}: {v_fmt}")
 
+        section = [
+            f"{emoji} `{ts}` — *{symbol}*",
+            f"• Reason: {reason}",
+            *detail_lines
+        ]
+        sections.append("\n".join(section))
 
+    # Join and send as a single Telegram message
+    message = "\n\n".join(sections)
+    send_telegram(message, parse_mode="Markdown")
 
 
 SESSION_FREEZE_WINDOWS = {
