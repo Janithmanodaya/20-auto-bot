@@ -265,7 +265,8 @@ CONFIG = {
             "BE_SL_OFFSET": 0.0
         },
         "10": {  # S10 uses S5-style management; no generic BE/TP here
-            "ATR_MULTIPLIER": float(os.getenv("S10_TRAIL_ATR_MULT", os.getenv("S5_TRAIL_ATR_MULT", "1.0"))),
+            # Make trailing less aggressive by default (increase ATR multiplier)
+            "ATR_MULTIPLIER": float(os.getenv("S10_TRAIL_ATR_MULT", os.getenv("S5_TRAIL_ATR_MULT", "1.75"))),
             "BE_TRIGGER": 0.0,
             "BE_SL_OFFSET": 0.0
         }
@@ -2318,6 +2319,32 @@ def get_current_price_sync(symbol: str) -> float:
         pass
     return 0.0
 
+
+def compute_be_sl(symbol: str, side: Optional[str], entry_price: float, strategy_id: Optional[int]) -> float:
+    """
+    Returns the break-even stop price with a small buffer for the given strategy.
+    - For BUY: BE = entry_price * (1 + buffer_pct)
+    - For SELL: BE = entry_price * (1 - buffer_pct)
+    Defaults to 0 buffer if not configured.
+    """
+    try:
+        if strategy_id == 10:
+            pct = float(CONFIG.get('STRATEGY_10', {}).get('BE_BUFFER_PCT', 0.0))
+        elif strategy_id == 5:
+            pct = float(CONFIG.get('STRATEGY_5', {}).get('BE_BUFFER_PCT', 0.0))
+        else:
+            pct = 0.0
+    except Exception:
+        pct = 0.0
+
+    if pct <= 0 or not np.isfinite(entry_price) or entry_price <= 0:
+        return float(entry_price)
+
+    if str(side).upper() == 'BUY':
+        return float(entry_price) * (1.0 + pct)
+    else:
+        return float(entry_price) * (1.0 - pct)
+
 def place_limit_order_sync(symbol: str, side: str, qty: float, price: float, leverage: Optional[int] = None):
     """
     Places a single limit order with safety features:
@@ -2687,29 +2714,6 @@ def place_batch_sl_tp_sync(symbol: str, side: str, sl_price: Optional[float] = N
             raise
     else:
         current_qty = qty
-
-    # --- Validate and adjust stop prices to avoid immediate trigger (-2021) ---
-    try:
-        current_price = get_current_price_sync(symbol)
-        tick = get_price_tick_size(symbol)
-        # Require a minimum gap of either 2 ticks or 0.05% of price
-        min_gap = max(tick * 2.0 if tick > 0 else 0.0, current_price * 0.0005 if current_price > 0 else 0.0)
-
-        if current_price > 0 and min_gap > 0:
-            if side == 'BUY':
-                # SL must be strictly below current price, TP strictly above
-                if sl_price is not None and sl_price >= current_price:
-                    sl_price = current_price - min_gap
-                if tp_price is not None and tp_price <= current_price:
-                    tp_price = current_price + min_gap
-            else:  # SELL
-                if sl_price is not None and sl_price <= current_price:
-                    sl_price = current_price + min_gap
-                if tp_price is not None and tp_price >= current_price:
-                    tp_price = current_price - min_gap
-    except Exception:
-        # If we cannot fetch current price, proceed without adjustment
-        pass
 
     close_side = 'SELL' if side == 'BUY' else 'BUY'
     order_batch = []
@@ -4645,14 +4649,11 @@ async def evaluate_strategy_10(symbol: str, df_m15: pd.DataFrame):
         min_notional = await asyncio.to_thread(get_min_notional_sync, symbol)
         qty_min = await asyncio.to_thread(round_qty, symbol, (min_notional / entry_price) if entry_price > 0 else 0.0, rounding=ROUND_CEILING)
 
-        if ideal_qty < qty_min or ideal_qty <= 0:
-            _record_rejection(symbol, "S10-Qty below minimum", {"ideal": ideal_qty, "min": qty_min})
-            return
-
-        final_qty = ideal_qty
-        notional = final_qty * entry_price
-        actual_risk_usdt = final_qty * distance
-        margin_to_use = CONFIG["MARGIN_USDT_SMALL_BALANCE"] if balance < CONFIG["RISK_SMALL_BALANCE_THRESHOLD"] else actual_risk_usdt
+        # Adopt S5's minimum-notional small-account path for S10 as well
+        if balance <= CONFIG.get('RISK_SMALL_BALANCE_THRESHOLD', 50.0):
+            # Small-account path: use minimum notional with a slight buffer and dynamic margin/leverage
+            target_notional = float(min_notional) * 1.10  # small buffer above min notional
+            base_margin = max(1.0, round(0.10 * float(min_notional), 2tual_risk_usdt
         uncapped_leverage = int(math.ceil(notional / max(margin_to_use, 1e-9)))
         max_leverage = min(CONFIG.get("MAX_BOT_LEVERAGE", 30), get_max_leverage(symbol))
         leverage = max(1, min(uncapped_leverage, max_leverage))
@@ -6411,7 +6412,7 @@ def monitor_thread_func():
                                 
                                 cancel_trade_sltp_orders_sync(meta)
                                 new_qty = meta['qty'] - qty_to_close
-                                new_sl_price = entry_price # Move to BE
+                                new_sl_price = compute_be_sl(symbol, side, float(entry_price), int(meta.get('strategy_id') if isinstance(meta, dict) else strategy_id if 'strategy_id' in locals() else 10)) # Move to BE with buffer
                                 new_orders = place_batch_sl_tp_sync(sym, side, sl_price=new_sl_price, qty=new_qty) if new_qty > 0 else {}
 
                                 trade_to_update_in_db = None
