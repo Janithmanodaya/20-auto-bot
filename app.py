@@ -2274,6 +2274,50 @@ def round_price(symbol: str, price: float) -> str:
         log.exception("round_price failed; falling back to basic formatting")
     return f"{price:.8f}"
 
+
+def get_price_tick_size(symbol: str) -> float:
+    """
+    Returns the tick size (minimum price increment) for the given symbol, or 0 if unavailable.
+    """
+    try:
+        info = get_exchange_info_sync()
+        if not info or not isinstance(info, dict):
+            return 0.0
+        symbol_info = next((s for s in info.get('symbols', []) if s.get('symbol') == symbol), None)
+        if not symbol_info:
+            return 0.0
+        for f in symbol_info.get('filters', []):
+            if f.get('filterType') == 'PRICE_FILTER':
+                ts = f.get('tickSize')
+                return float(ts) if ts is not None else 0.0
+    except Exception:
+        log.exception("get_price_tick_size failed")
+    return 0.0
+
+
+def get_current_price_sync(symbol: str) -> float:
+    """
+    Fetches current futures price for symbol. Tries symbol ticker then mark price.
+    """
+    global client
+    if client is None:
+        return 0.0
+    try:
+        tkr = client.futures_symbol_ticker(symbol=symbol)
+        p = tkr.get('price')
+        if p is not None:
+            return float(p)
+    except Exception:
+        pass
+    try:
+        mp = client.futures_mark_price(symbol=symbol)
+        p = mp.get('markPrice')
+        if p is not None:
+            return float(p)
+    except Exception:
+        pass
+    return 0.0
+
 def place_limit_order_sync(symbol: str, side: str, qty: float, price: float, leverage: Optional[int] = None):
     """
     Places a single limit order with safety features:
@@ -2643,6 +2687,29 @@ def place_batch_sl_tp_sync(symbol: str, side: str, sl_price: Optional[float] = N
             raise
     else:
         current_qty = qty
+
+    # --- Validate and adjust stop prices to avoid immediate trigger (-2021) ---
+    try:
+        current_price = get_current_price_sync(symbol)
+        tick = get_price_tick_size(symbol)
+        # Require a minimum gap of either 2 ticks or 0.05% of price
+        min_gap = max(tick * 2.0 if tick > 0 else 0.0, current_price * 0.0005 if current_price > 0 else 0.0)
+
+        if current_price > 0 and min_gap > 0:
+            if side == 'BUY':
+                # SL must be strictly below current price, TP strictly above
+                if sl_price is not None and sl_price >= current_price:
+                    sl_price = current_price - min_gap
+                if tp_price is not None and tp_price <= current_price:
+                    tp_price = current_price + min_gap
+            else:  # SELL
+                if sl_price is not None and sl_price <= current_price:
+                    sl_price = current_price + min_gap
+                if tp_price is not None and tp_price >= current_price:
+                    tp_price = current_price - min_gap
+    except Exception:
+        # If we cannot fetch current price, proceed without adjustment
+        pass
 
     close_side = 'SELL' if side == 'BUY' else 'BUY'
     order_batch = []
