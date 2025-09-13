@@ -488,8 +488,8 @@ REJECTION_REASON_EMOJI = {
     "S10-Entry/Stop calc failed": "🧮",
     "S10-Invalid SL distance": "🧮",
     "S10-Qty below minimum": "📉",
-    "S10-VBM stop too wide": "📐_code",new
-</}
+    "S10-VBM stop too wide": "📐"
+}
 
 
 # Account state
