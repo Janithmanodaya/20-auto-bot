@@ -63,6 +63,10 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 USE_TESTNET = False  # Force MAINNET — testnet mode removed per user request
 
+# Alpha Vantage (hard-coded per user request)
+ALPHA_VANTAGE_API_KEY = "EU4VA0HP1D24U_codeYAnew0</"
+
+
 # SSH Tunnel Config is now managed via ssh_config.json
 # -------------------------
 
@@ -384,6 +388,109 @@ last_attention_alert_time: Dict[str, datetime] = {}
 symbol_loss_cooldown: Dict[str, datetime] = {}
 symbol_trade_cooldown: Dict[str, datetime] = {}
 last_env_rejection_log: Dict[tuple[str, str], float] = {}
+
+# Emoji map for clearer rejection messages
+REJECTION_REASON_EMOJI = {
+    "Liquidity Grab Detected": "💧",
+    "Bot Paused": "⏸️",
+    "Post-Trade Cooldown": "🧊",
+    "Loss Cooldown": "🧯",
+    "Position Already Open": "📌",
+    "Pending Order Exists": "📝",
+    "Max Trades Reached": "🚦",
+    # Strategy-specific
+    "S1-Not enough bars for S1": "⏳",
+    "S1-BBands not ready": "📉",
+    "S1-Not a BB signal": "⚪",
+    "S1-Prev candle not bullish": "🔴",
+    "S1-Prev candle not bearish": "🔵",
+    "S1-ADX too strong": "📈",
+    "S1-Zero distance for sizing": "➖",
+    "S1-Qty zero after sizing": "0️⃣",
+    "S2-Not enough bars for S2": "⏳",
+    "S2-SuperTrend not ready": "🟩",
+    "S2-No ST flip": "↕️",
+    "S2-Prev candle not bullish": "🔴",
+    "S2-Prev candle not bearish": "🔵",
+    "S2-Zero distance for sizing": "➖",
+    "S2-Qty zero after sizing": "0️⃣",
+    "S3-Not enough bars for S3": "⏳",
+    "S3-MAs not ready": "📊",
+    "S3-No MA cross": "➗",
+    "S3-Zero distance for sizing": "➖",
+    "S3-Qty zero after sizing": "0️⃣",
+    "S4 EMA Filter Not Ready": "⛔",
+    "S4 Price crossing EMA": "⚠️",
+    "S4 Awaiting Buy Confluence": "🟢",
+    "S4 Awaiting Sell Confluence": "🔴",
+    "S4 Invalid SL Distance": "🧮",
+    "S4 Risk Too Low": "⚖️",
+    "S4 Qty Zero": "0️⃣",
+    "S5-Restricted symbol": "🚫",
+    "S5-Not enough M15 data": "⏳",
+    "S5-ATR pct out of band": "📏",
+    "S5-No confluence": "🧩",
+    "S5-Invalid SL distance": "🧮",
+    "S5-Qty below minimum": "📉",
+    "S6-Restricted symbol": "🚫",
+    "S6-Not enough M15 data": "⏳",
+    "S6-Outside session window": "🕒",
+    "S6-Not enough HTF data": "⏳",
+    "S6-Daily bias unclear": "🌫️",
+    "S6-H4 contradicts Daily": "⚔️",
+    "S6-No POI touch on signal candle": "🎯",
+    "S6-No valid rejection candle": "🚫",
+    "S6-No follow-through": "🐌",
+    "S6-Invalid SL distance": "🧮",
+    "S6-Qty below minimum": "📉",
+    "S7-Restricted symbol": "🚫",
+    "S7-Not enough M15 data": "⏳",
+    "S7-Not enough H1 data": "⏳",
+    "S7-No BOS on H1": "📉",
+    "S7-No POI touch on M15": "🎯",
+    "S7-No valid rejection": "🚫",
+    "S7-No follow-through": "🐌",
+    "S7-Qty min invalid": "❓",
+    "S8-Restricted symbol": "🚫",
+    "S8-Not enough M15 data": "⏳",
+    "S8-ATR not ready": "📏",
+    "S8-HTF bias unclear": "🌫️",
+    "S8-Not enough H1 data": "⏳",
+    "S8-No BOS on H1": "📉",
+    "S8-BOS dir != HTF bias": "↔️",
+    "S8-No POI zone (OB/FVG)": "🧱",
+    "S8-Pattern not inside/touching POI": "🧭",
+    "S8-No valid pattern/confirmation": "🚫",
+    "S8-Invalid SL distance": "🧮",
+    "S8-Qty zero after sizing": "0️⃣",
+    "S9-Restricted symbol": "🚫",
+    "S9-Insufficient TF data": "⏳",
+    "S9-Outside session window": "🕒",
+    "S9-Daily bias unclear": "🌫️",
+    "S9-H4 contradicts Daily": "⚔️",
+    "S9-No matching H1 BOS": "📉",
+    "S9-No OB zone": "🧱",
+    "S9-No micro sweep+reclaim": "🌊",
+    "S9-Entry not inside OB": "🚫",
+    "S9-Rejection wick too small": "🕯️",
+    "S9-Weak M1 rejection range": "📉",
+    "S9-M5 ATR invalid": "📏",
+    "S9-Invalid SL distance": "🧮",
+    "S9-Stop too wide vs M5 range": "📐",
+    "S9-Qty below minimum": "📉",
+
+    # Strategy 10 (AA + VBM)
+    "S10-Restricted symbol": "🚫",
+    "S10-Not enough M15 data": "⏳",
+    "S10-Not enough H1 data": "⏳",
+    "S10-AA stop too wide": "📐",
+    "S10-No valid AA/VBM setup": "🧩",
+    "S10-Entry/Stop calc failed": "🧮",
+    "S10-Invalid SL distance": "🧮",
+    "S10-Qty below minimum": "📉",
+    "S10-VBM stop too wide": "📐_code",new
+</}
+
 
 # Account state
 IS_HEDGE_MODE: Optional[bool] = None
@@ -1272,32 +1379,47 @@ def _record_rejection(symbol: str, reason: str, details: dict, signal_candle: Op
 
 
 def handle_reject_cmd():
-    """Formats the last 20 in-memory rejections for Telegram."""
+    """Formats the last 20 in-memory rejections for Telegram with emojis and cleaner layout."""
     global rejected_trades
     if not rejected_trades:
         send_telegram("No rejected trades have been recorded in memory since the last restart.")
         return
 
-    report_lines = ["*Last 20 Rejected Trades (from memory)*"]
-    # The deque stores the most recent items, so we iterate in reverse to show newest first.
+    header = "🧾 Last 20 Rejected Trades (memory)"
+    sections = [f"*{header}*"]
+
+    # Newest first
     for reject in reversed(list(rejected_trades)):
         try:
             ts = datetime.fromisoformat(reject['timestamp']).strftime('%H:%M:%S')
-            details = reject.get('details', {})
-            details_str = ", ".join([f"{k}: {v}" for k, v in details.items()])
-            
-            line_report = (
-                f"\n- - - - - - - - - - - - - - - - - -\n"
-                f"**Symbol:** `{reject['symbol']}`\n"
-                f"**Time:** `{ts} UTC`\n"
-                f"**Reason:** `{reject['reason']}`\n"
-                f"**Details:** `{details_str if details else 'N/A'}`"
-            )
-            report_lines.append(line_report)
-        except (KeyError) as e:
-            log.warning(f"Could not parse rejection record: {reject}. Error: {e}")
-    
-    send_telegram("\n".join(report_lines), parse_mode='Markdown')
+            symbol = reject.get('symbol', 'N/A')
+            reason = reject.get('reason', 'Unknown')
+            details = reject.get('details') or {}
+
+            # Pick an emoji based on the reason
+            emoji = REJECTION_REASON_EMOJI.get(reason, "⚠️")
+
+            # If details is empty, add helpful defaults
+            if not details:
+                details = {
+                    "note": "No extra diagnostics captured for this rejection.",
+                    "timeframe": CONFIG.get("TIMEFRAME", "N/A"),
+                }
+
+            # Build details block as bullet list
+            detail_lines = []
+            for k, v in details.items():
+                # Normalize to simple scalars/strings
+                try:
+                    if isinstance(v, float):
+                        v_fmt = f"{v:.4f}"
+                    else:
+                        v_fmt = str(v)
+                except Exception:
+                    v_fmt = str(v)
+                detail_lines.append(f"   - {k}: {v_fmt}")
+
+
 
 
 SESSION_FREEZE_WINDOWS = {
@@ -3189,8 +3311,14 @@ async def evaluate_and_enter(symbol: str):
                 return
 
         try:
-            modes = CONFIG["STRATEGY_MODE"]             run_s4 = 4 in modes or 0 in modes             run_s5 = 5 in modes or 0 in modes             run_s6 = 6 in modes or 0 in modes             run_s10 = 10 in modes or 0 in modes           2 run_others = any(m in modes for m in [1, 2, 3, 5, 6, 7, 8, 9, 10]) or 0 in m_codeodnewe</s
- modes
+            modes = CONFIG["STRATEGY_MODE"]
+            # Determine which strategy evaluators should run this cycle
+            run_s4 = (4 in modes) or (0 in modes)
+            run_s5 = (5 in modes) or (0 in modes)
+            run_s6 = (6 in modes) or (0 in modes)
+            run_s10 = (10 in modes) or (0 in modes)
+            # Run the standard OHLCV path for these strategies
+            run_others = any(m in modes for m in [1, 2, 3, 5, 6, 7, 8, 9, 10]) or (0 in modes)
 
             # Fetch a larger dataset if S4/Renko is active, otherwise default.
             limit = 1000 if run_s4 else 250
