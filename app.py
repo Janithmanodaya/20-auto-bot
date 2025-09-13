@@ -4648,14 +4648,11 @@ async def evaluate_strategy_10(symbol: str, df_m15: pd.DataFrame):
         min_notional = await asyncio.to_thread(get_min_notional_sync, symbol)
         qty_min = await asyncio.to_thread(round_qty, symbol, (min_notional / entry_price) if entry_price > 0 else 0.0, rounding=ROUND_CEILING)
 
-        if ideal_qty < qty_min or ideal_qty <= 0:
-            _record_rejection(symbol, "S10-Qty below minimum", {"ideal": ideal_qty, "min": qty_min})
-            return
-
-        final_qty = ideal_qty
-        notional = final_qty * entry_price
-        actual_risk_usdt = final_qty * distance
-        margin_to_use = CONFIG["MARGIN_USDT_SMALL_BALANCE"] if balance < CONFIG["RISK_SMALL_BALANCE_THRESHOLD"] else actual_risk_usdt
+        # Adopt S5's minimum-notional small-account path for S10 as well
+        if balance <= CONFIG.get('RISK_SMALL_BALANCE_THRESHOLD', 50.0):
+            # Small-account path: use minimum notional with a slight buffer and dynamic margin/leverage
+            target_notional = float(min_notional) * 1.10  # small buffer above min notional
+            base_margin = max(1.0, round(0.10 * float(min_notional), 2tual_risk_usdt
         uncapped_leverage = int(math.ceil(notional / max(margin_to_use, 1e-9)))
         max_leverage = min(CONFIG.get("MAX_BOT_LEVERAGE", 30), get_max_leverage(symbol))
         leverage = max(1, min(uncapped_leverage, max_leverage))
