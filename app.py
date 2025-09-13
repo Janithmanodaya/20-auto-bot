@@ -488,8 +488,8 @@ REJECTION_REASON_EMOJI = {
     "S10-Entry/Stop calc failed": "🧮",
     "S10-Invalid SL distance": "🧮",
     "S10-Qty below minimum": "📉",
-    "S10-VBM stop too wide": "📐_code",new
-</}
+    "S10-VBM stop too wide": "📐",
+}
 
 
 # Account state
@@ -1409,7 +1409,6 @@ def handle_reject_cmd():
             # Build details block as bullet list
             detail_lines = []
             for k, v in details.items():
-                # Normalize to simple scalars/strings
                 try:
                     if isinstance(v, float):
                         v_fmt = f"{v:.4f}"
@@ -1419,10 +1418,8 @@ def handle_reject_cmd():
                     v_fmt = str(v)
                 detail_lines.append(f"   - {k}: {v_fmt}")
 
-
-
-
-SESSION_FREEZE_WINDOWS = {
+            section = (
+                f"\n- - - - - - - - - - - - - - - - - - = {
     "London": (7, 9),
     "New York": (12, 14),
     "Tokyo": (23, 1)  # Crosses midnight
