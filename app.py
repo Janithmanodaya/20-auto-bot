@@ -1,5 +1,6 @@
 # app.py
 """
+This code version is - 1.10 every time if you make any small update increase this number for tracking purposes
 EMA/BB Strategy Bot — Refactored from KAMA base.
  - DualLock for cross-thread locking
  - Exchange info cache to avoid repeated futures_exchange_info calls
@@ -4838,14 +4839,24 @@ async def evaluate_strategy_10(symbol: str, df_m15: pd.DataFrame):
             await asyncio.to_thread(add_pending_order_to_db, pending_meta)
 
         title = "⏳ New Pending Order: S10-AA+VBM"
-        # Fetch recent news sentiment/impact for context
+        # Fetch recent news sentiment/impact for context (best-effort)
         try:
             news = await asyncio.to_thread(fetch_recent_news_impact, symbol, 24, 3)
         except Exception:
-            news = {"impact": "NonePrice: `{entry_price:.4f}`\n"
+            news = {"impact": "None", "reason": "news fetch failed", "articles": []}
+
+        # Build and send Telegram notification
+        new_order_msg = (
+            f"{title}\n\n"
+            f"Symbol: `{symbol}`\n"
+            f"Side: `{side}`\n"
+            f"Price: `{entry_price:.4f}`\n"
             f"Qty: `{final_qty}`\n"
             f"Risk: `{actual_risk_usdt:.2f} USDT`\n"
-            f"Leverage: `{leverage}x`"
+            f"Leverage: `{leverage}x`\n"
+            f"Stacked: `{bool(stacked)}`\n"
+            f"Component: `{pending_meta.get('s10_component', 'N/A')}`\n"
+            f"News impact: `{news.get('impact', 'None')}` — {news.get('reason', '')}"
         )
         await asyncio.to_thread(send_telegram, new_order_msg, parse_mode='Markdown')
 
