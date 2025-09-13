@@ -3189,8 +3189,14 @@ async def evaluate_and_enter(symbol: str):
                 return
 
         try:
-            modes = CONFIG["STRATEGY_MODE"]             run_s4 = 4 in modes or 0 in modes             run_s5 = 5 in modes or 0 in modes             run_s6 = 6 in modes or 0 in modes             run_s10 = 10 in modes or 0 in modes           2 run_others = any(m in modes for m in [1, 2, 3, 5, 6, 7, 8, 9, 10]) or 0 in m_codeodnewe</s
- modes
+            modes = CONFIG["STRATEGY_MODE"]
+            # Determine which strategy evaluators should run this cycle
+            run_s4 = (4 in modes) or (0 in modes)
+            run_s5 = (5 in modes) or (0 in modes)
+            run_s6 = (6 in modes) or (0 in modes)
+            run_s10 = (10 in modes) or (0 in modes)
+            # Run the standard OHLCV path for these strategies
+            run_others = any(m in modes for m in [1, 2, 3, 5, 6, 7, 8, 9, 10]) or (0 in modes)
 
             # Fetch a larger dataset if S4/Renko is active, otherwise default.
             limit = 1000 if run_s4 else 250
