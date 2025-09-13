@@ -2274,6 +2274,50 @@ def round_price(symbol: str, price: float) -> str:
         log.exception("round_price failed; falling back to basic formatting")
     return f"{price:.8f}"
 
+
+def get_price_tick_size(symbol: str) -> float:
+    """
+    Returns the tick size (minimum price increment) for the given symbol, or 0 if unavailable.
+    """
+    try:
+        info = get_exchange_info_sync()
+        if not info or not isinstance(info, dict):
+            return 0.0
+        symbol_info = next((s for s in info.get('symbols', []) if s.get('symbol') == symbol), None)
+        if not symbol_info:
+            return 0.0
+        for f in symbol_info.get('filters', []):
+            if f.get('filterType') == 'PRICE_FILTER':
+                ts = f.get('tickSize')
+                return float(ts) if ts is not None else 0.0
+    except Exception:
+        log.exception("get_price_tick_size failed")
+    return 0.0
+
+
+def get_current_price_sync(symbol: str) -> float:
+    """
+    Fetches current futures price for symbol. Tries symbol ticker then mark price.
+    """
+    global client
+    if client is None:
+        return 0.0
+    try:
+        tkr = client.futures_symbol_ticker(symbol=symbol)
+        p = tkr.get('price')
+        if p is not None:
+            return float(p)
+    except Exception:
+        pass
+    try:
+        mp = client.futures_mark_price(symbol=symbol)
+        p = mp.get('markPrice')
+        if p is not None:
+            return float(p)
+    except Exception:
+        pass
+    return 0.0
+
 def place_limit_order_sync(symbol: str, side: str, qty: float, price: float, leverage: Optional[int] = None):
     """
     Places a single limit order with safety features:
