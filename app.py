@@ -4842,29 +4842,10 @@ async def evaluate_strategy_10(symbol: str, df_m15: pd.DataFrame):
         try:
             news = await asyncio.to_thread(fetch_recent_news_impact, symbol, 24, 3)
         except Exception:
-            news = {"impact": "None", "reason": "News fetch failed.", "articles": []}
-        # Build optional headline line
-        headline = ""
-        if news.get("articles"):
-            a0 = news["articles"][0]
-            ttl = a0.get("title") or ""
-            url0 = a0.get("url") or ""
-            if ttl and url0:
-                headline = f"\nTop headline: [{ttl}]({url0})"
-            elif ttl:
-                headline = f"\nTop headline: {ttl}"
-
-        new_order_msg = (
-            f"{title}\n\n"
-            f"Symbol: `{symbol}`\n"
-            f"Side: `{side}`\n"
-            f"Mode: `{'STACKED' if stacked else ('AA' if aa_ok else 'VBM')}`\n"
-            f"Price: `{entry_price:.4f}`\n"
+            news = {"impact": "NonePrice: `{entry_price:.4f}`\n"
             f"Qty: `{final_qty}`\n"
             f"Risk: `{actual_risk_usdt:.2f} USDT`\n"
-            f"Leverage: `{leverage}x`\n"
-            f"News Impact: `{news.get('impact','None')}`\n"
-            f"Reason: {news.get('reason','')}{headline}"
+            f"Leverage: `{leverage}x`"
         )
         await asyncio.to_thread(send_telegram, new_order_msg, parse_mode='Markdown')
 
