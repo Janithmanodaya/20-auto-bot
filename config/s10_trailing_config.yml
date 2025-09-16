@@ -1,0 +1,36 @@
+# S10 Trailing Stop — Plan A Configuration (no code, config-only)
+# All percentages are decimals, e.g. 0.10% = 0.0010
+
+# 1) Gating / Break-even (BE)
+S10_BE_TRIGGER_R: 1.0                 # Do not trail until trade reaches >= 1R
+S10_BE_TRIGGER_PCT: null              # Alternative to R trigger (prefer R); example 0.005 = 0.5%
+S10_BE_SL_OFFSET_PCT: 0.0010          # Move to BE with +0.10% offset to cover taker fees
+
+# 2) Anti-whipsaw timing guard
+S10_NO_TRAIL_BARS: 2                  # Skip trailing updates for first N S10 bars after entry
+
+# 3) Conservative hybrid trail
+S10_PIVOT_LOOKBACK: 5                 # Swing pivot lookback for pivot stop
+S10_TRAIL_ATR_MULT_STRONG: 2.0        # ATR multiplier when ADX >= threshold
+S10_TRAIL_ATR_MULT_WEAK: 2.8          # ATR multiplier when ADX < threshold
+S10_TRAIL_BUFFER_MULT: 0.30           # Subtract this × ATR from candidate stop (extra buffer)
+S10_ADX_TREND_MIN: 25                 # ADX threshold for "strong" trend
+S10_USE_ADAPTIVE_TRAIL: true          # Enable ADX-based multiplier switching
+
+# 4) Minimum stop movement (avoid micro-ratchet)
+# Recommended: compute as max(tick_size_pct, 2 * taker_fee_pct) per symbol
+# If your engine cannot compute this, set S10_MIN_SL_MOVE_PCT explicitly.
+S10_MIN_SL_MOVE_PCT: null             # If null, compute from tick + fees below; otherwise use fixed value
+S10_TICK_SIZE_PCT: 0.0001             # Example: 0.01% = 0.0001 (symbol-specific)
+S10_TAKER_FEE_PCT: 0.0007             # Example: 0.07% taker fee = 0.0007 (venue-specific)
+
+# 5) Stacked setups
+S10_STACKED_PARTIAL_CLOSE_PCT: 0.25   # Close 25% at 1R for stacked setups
+S10_STACKED_WIDER_MULT_BONUS: 0.25    # Add to ATR mult until ADX confirms
+
+# 6) Optional stability guard — cooldown per symbol (default off)
+S10_COOLDOWN_ENABLED: false           # If true, pause S10 when small-loss streak detected
+S10_COOLDOWN_SMALL_LOSS_R: 0.5        # "Small loss" definition in R
+S10_COOLDOWN_N: 3                     # N consecutive small losses
+S10_COOLDOWN_M: 10                    # Within last M trades
+S10_COOLDOWN_DURATION_H: 24           # Pause duration in hours when triggered
