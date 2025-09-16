@@ -1,7 +1,6 @@
 # app.py
 """
-This code version is - 1.10 every time if you make any small update increase this number for tracking purposes - last update 1.09
-EMA/BB Strategy Bot — Refactored from KAMA base.
+This code version is - 1.10 every time if you make any small update increase this number for tracking purposes - last update _codeEMA/BB Strategy Bot — Refactored from KAMA base.
  - DualLock for cross-thread locking
  - Exchange info cache to avoid repeated futures_exchange_info calls
  - Monitor thread persists unrealized PnL and SL updates back to managed_trades
@@ -84,6 +83,22 @@ main_loop: Optional[asyncio.AbstractEventLoop] = None
 # -------------------------
 # CONFIG (edit values here)
 # -------------------------
+# S10 trailing config (defaults)
+S10_BE_TRIGGER_R = 1.0
+S10_BE_TRIGGER_PCT = None
+S10_BE_SL_OFFSET_PCT = 0.0010     # 0.10% (0.0010 decimal)
+S10_NO_TRAIL_BARS = 2
+S10_PIVOT_LOOKBACK = 5
+S10_TRAIL_ATR_MULT_STRONG = 2.0
+S10_TRAIL_ATR_MULT_WEAK = 2.8
+S10_TRAIL_BUFFER_MULT = 0.30
+S10_ADX_TREND_MIN = 25
+S10_MIN_SL_MOVE_PCT = None        # set at runtime: max(tick_size_pct, 2 * taker_fee_pct)
+S10_STACKED_PARTIAL_CLOSE_PCT = 0.25
+S10_STACKED_WIDER_MULT_BONUS = 0.25
+S10_USE_ADAPTIVE_TRAIL = True
+S10_TRAIL_DISABLED = False        # global kill-switch for quick rollback
+
 CONFIG = {
     # --- STRATEGY ---
     "STRATEGY_MODE": os.getenv("STRATEGY_MODE", "5,6,7,8,9,10"),
@@ -2120,6 +2135,100 @@ def adx(df: pd.DataFrame, period: int = 14):
     dx_denominator = (df['+DI'] + df['-DI']).replace(0, 1e-10)
     dx = 100 * (abs(df['+DI'] - df['-DI']) / dx_denominator)
     df['adx'] = dx.ewm(alpha=alpha, adjust=False).mean()
+
+
+# -------------------------
+# S10 helper utilities (small and self-contained)
+# -------------------------
+def compute_r_multiple(entry_price: float, current_price: float, initial_stop_price: float) -> float:
+    """
+    Compute R-multiple from entry and current price relative to initial stop.
+    Returns absolute R (unsigned). Caller can apply direction if needed.
+    """
+    try:
+        risk = abs(float(entry_price) - float(initial_stop_price))
+        if risk <= 0:
+            return 0.0
+        return abs(float(current_price) - float(entry_price)) / risk
+    except Exception:
+        return 0.0
+
+
+def _last_closed_slice(df: pd.DataFrame, lookback: int) -> pd.DataFrame:
+    if df is None or df.empty or lookback <= 0:
+        return pd.DataFrame()
+    # Use only fully closed candles: exclude the latest forming one if any
+    if len(df) >= lookback + 1:
+        return df.iloc[-(lookback+1):-1]
+    return df.iloc[:-1]
+
+
+def get_last_pivot_low(symbol: str, lookback: int = 5) -> float:
+    """
+    Return last swing low across lookback closed bars on CONFIG['TIMEFRAME'].
+    """
+    try:
+        df = fetch_klines_sync(symbol, CONFIG.get("TIMEFRAME", "15m"), max(lookback + 10, 50))
+        sl = _last_closed_slice(df, lookback)
+        if sl is None or sl.empty:
+            return float('nan')
+        return float(sl['low'].min())
+    except Exception:
+        return float('nan')
+
+
+def get_last_pivot_high(symbol: str, lookback: int = 5) -> float:
+    """
+    Return last swing high across lookback closed bars on CONFIG['TIMEFRAME'].
+    """
+    try:
+        df = fetch_klines_sync(symbol, CONFIG.get("TIMEFRAME", "15m"), max(lookback + 10, 50))
+        sl = _last_closed_slice(df, lookback)
+        if sl is None or sl.empty:
+            return float('nan')
+        return float(sl['high'].max())
+    except Exception:
+        return float('nan')
+
+
+def compute_s10_mult(adx_value: float, is_stacked: bool) -> float:
+    """
+    Determine ATR trailing multiplier per S10 rules.
+    """
+    mult = S10_TRAIL_ATR_MULT_WEAK
+    try:
+        if S10_USE_ADAPTIVE_TRAIL and float(adx_value) >= float(S10_ADX_TREND_MIN):
+            mult = S10_TRAIL_ATR_MULT_STRONG
+        elif bool(is_stacked) and float(adx_value) < float(S10_ADX_TREND_MIN):
+            mult = S10_TRAIL_ATR_MULT_WEAK + S10_STACKED_WIDER_MULT_BONUS
+    except Exception:
+        pass
+    return float(mult)
+
+
+def get_tick_info(symbol: str, ref_price: Optional[float] = None) -> tuple[float, float]:
+    """
+    Returns (tick_size, tick_size_pct_at_ref_price). If ref_price is not provided or <=0, pct is 0.
+    """
+    tick = get_price_tick_size(symbol) or 0.0
+    if ref_price and ref_price > 0:
+        return float(tick), float(tick) / float(ref_price)
+    return float(tick), 0.0
+
+
+def apply_min_sl_move_filter(current_sl: float, candidate_sl: float, price: float, tick_size: float, min_sl_move_pct: Optional[float]) -> bool:
+    """
+    Returns True if abs move >= min_move, where min_move = max(tick_size, min_sl_move_pct * price) if pct provided.
+    """
+    try:
+        if current_sl is None or candidate_sl is None:
+            return False
+        min_move = float(tick_size)
+        if min_sl_move_pct is not None:
+            min_move = max(min_move, float(min_sl_move_pct) * float(price))
+        return abs(float(candidate_sl) - float(current_sl)) >= max(min_move, 0.0)
+    except Exception:
+        return False
 
 
 def supertrend(df: pd.DataFrame, period: int = 10, multiplier: float = 3.0, atr_series: Optional[pd.Series] = None, source: Optional[pd.Series] = None) -> tuple[pd.Series, pd.Series]:
@@ -5034,9 +5143,17 @@ async def evaluate_strategy_10(symbol: str, df_m15: pd.DataFrame):
             "strategy_id": 10,
             "atr_at_entry": float(sig_m15['s10_atr_m15']),
             "trailing": True,
+            # --- S10 markers for monitor/manager ---
+            "strategy": "S10",
+            "s10_trailing_activated": False,
+            "s10_is_stacked": bool(stacked),
+            "initial_stop_price": float(stop_price),
+            "entry_price": float(entry_price),
+            "s10_no_trail_bars": int(S10_NO_TRAIL_BARS),
             "s10_stacked": bool(stacked),
             "s10_component": "STACKED" if stacked else ("AA" if aa_ok else "VBM"),
-        }
+     _code  new </}
+   }
 
         async with pending_limit_orders_lock:
             pending_limit_orders[pending_order_id] = pending_meta
