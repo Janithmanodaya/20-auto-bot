@@ -2713,20 +2713,54 @@ def place_market_order_with_sl_tp_sync(symbol: str, side: str, qty: float, lever
         # In one-way mode, closing orders must be reduceOnly. Entry order must not.
         close_order_params['reduceOnly'] = True
 
+    # Safety adjustment to avoid -2021 "would immediately trigger" on STOP/TP orders
+    try:
+        current_price = get_current_price_sync(symbol)
+        tick = get_price_tick_size(symbol)
+        if tick <= 0:
+            tick = max(current_price * 0.0001, 1e-8)
+
+        if close_side == 'SELL':  # closing a LONG
+            # SL (SELL STOP) must be strictly below current price
+            sl_target = min(float(stop_price), current_price - 2 * tick)
+            sl_stop = round_price(symbol, sl_target)
+            if float(sl_stop) >= current_price:
+                sl_stop = round_price(symbol, current_price - 3 * tick)
+            # TP (SELL TAKE_PROFIT) must be strictly above current price
+            tp_target = max(float(take_price), current_price + 2 * tick)
+            tp_stop = round_price(symbol, tp_target)
+            if float(tp_stop) <= current_price:
+                tp_stop = round_price(symbol, current_price + 3 * tick)
+        else:  # closing a SHORT with BUY orders
+            # SL (BUY STOP) must be strictly above current price
+            sl_target = max(float(stop_price), current_price + 2 * tick)
+            sl_stop = round_price(symbol, sl_target)
+            if float(sl_stop) <= current_price:
+                sl_stop = round_price(symbol, current_price + 3 * tick)
+            # TP (BUY TAKE_PROFIT) must be strictly below current price
+            tp_target = min(float(take_price), current_price - 2 * tick)
+            tp_stop = round_price(symbol, tp_target)
+            if float(tp_stop) >= current_price:
+                tp_stop = round_price(symbol, current_price - 3 * tick)
+    except Exception:
+        # Fall back to raw rounding if any issue arises
+        sl_stop = round_price(symbol, stop_price)
+        tp_stop = round_price(symbol, take_price)
+
     # Build the full order batch
     order_batch = [market_order_params]
     
     sl_order = close_order_params.copy()
     sl_order.update({
         'type': 'STOP_MARKET',
-        'stopPrice': round_price(symbol, stop_price),
+        'stopPrice': sl_stop,
     })
     order_batch.append(sl_order)
     
     tp_order = close_order_params.copy()
     tp_order.update({
         'type': 'TAKE_PROFIT_MARKET',
-        'stopPrice': round_price(symbol, take_price),
+        'stopPrice': tp_stop,
     })
     order_batch.append(tp_order)
 
@@ -2854,19 +2888,65 @@ def place_batch_sl_tp_sync(symbol: str, side: str, sl_price: Optional[float] = N
     else:
         base_close_order['reduceOnly'] = True
 
-    if sl_price:
+    # --- Adjust stop prices relative to current market to avoid -2021 immediate trigger ---
+    sl_stop_str: Optional[str] = None
+    tp_stop_str: Optional[str] = None
+    try:
+        current_price = get_current_price_sync(symbol)
+        tick = get_price_tick_size(symbol)
+        if not np.isfinite(current_price) or current_price <= 0:
+            raise RuntimeError("bad current price")
+        if tick <= 0:
+            tick = max(current_price * 0.0001, 1e-8)
+
+        if sl_price is not None:
+            if close_side == 'SELL':
+                # SL (SELL STOP) must be below current price
+                target = min(float(sl_price), current_price - 2 * tick)
+                sl_stop_str = round_price(symbol, target)
+                if float(sl_stop_str) >= current_price:
+                    sl_stop_str = round_price(symbol, current_price - 3 * tick)
+            else:
+                # SL (BUY STOP) must be above current price
+                target = max(float(sl_price), current_price + 2 * tick)
+                sl_stop_str = round_price(symbol, target)
+                if float(sl_stop_str) <= current_price:
+                    sl_stop_str = round_price(symbol, current_price + 3 * tick)
+
+        if tp_price is not None:
+            if close_side == 'SELL':
+                # TP (SELL TAKE_PROFIT) must be above current price
+                target = max(float(tp_price), current_price + 2 * tick)
+                tp_stop_str = round_price(symbol, target)
+                if float(tp_stop_str) <= current_price:
+                    tp_stop_str = round_price(symbol, current_price + 3 * tick)
+            else:
+                # TP (BUY TAKE_PROFIT) must be below current price
+                target = min(float(tp_price), current_price - 2 * tick)
+                tp_stop_str = round_price(symbol, target)
+                if float(tp_stop_str) >= current_price:
+                    tp_stop_str = round_price(symbol, current_price - 3 * tick)
+    except Exception:
+        # Fallback to simple rounding if any of the above fails
+        if sl_price is not None:
+            sl_stop_str = round_price(symbol, sl_price)
+        if tp_price is not None:
+            tp_stop_str = round_price(symbol, tp_price)
+    # --- End adjustment ---
+
+    if sl_price is not None:
         sl_order = base_close_order.copy()
         sl_order.update({
             'type': 'STOP_MARKET',
-            'stopPrice': round_price(symbol, sl_price),
+            'stopPrice': sl_stop_str,
         })
         order_batch.append(sl_order)
     
-    if tp_price:
+    if tp_price is not None:
         tp_order = base_close_order.copy()
         tp_order.update({
             'type': 'TAKE_PROFIT_MARKET',
-            'stopPrice': round_price(symbol, tp_price),
+            'stopPrice': tp_stop_str,
         })
         order_batch.append(tp_order)
 
