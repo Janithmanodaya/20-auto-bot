@@ -1,6 +1,6 @@
 # app.py
 """
-This code version is - 1.12 every time if you make any small update increase this number for tracking purposes - last update _codeEMA/BB Strategy Bot — Refactored from KAMA base.
+This code version is - 1.13 every time if you make any small update increase this number for tracking purposes - last update _codeEMA/BB Strategy Bot — Refactored from KAMA base.
  - Added Strategy 12 (Small-account: SuperTrend + MACD + RSI using pandas-ta, S4-style fixed risk, 1.5R TP)
  - Added Strategy 11 (Mean Reversion with 1H Bollinger Bands, 4H RSI filter, 1H/4H ADX filter) with S4-style sizing
  - DualLock for cross-thread locking
@@ -3886,7 +3886,7 @@ async def evaluate_and_enter(symbol: str):
             run_s11 = (11 in modes) or (0 in modes)
             run_s12 = (12 in modes) or (0 in modes)
             # Run the standard OHLCV path for these strategies
-            run_others = any(m in modes for m in [1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12]) or (0 in mod_codeesnew)</
+            run_others = any(m in modes for m in [1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12]) or (0 in modes)
 
 
             # Fetch a larger dataset if S4/Renko is active, otherwise default.
